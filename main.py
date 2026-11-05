@@ -20,6 +20,10 @@ without a season applies to every season.
 Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
 c clear filters, x random pick, Enter details (o in details opens the folder), q quit.
 
+Caching: AniList results are cached (default 7 days, see --cache-days) and the
+watched list for an hour, so repeated runs make few requests. Several searches
+are sent in one request. Use --refresh to ignore the cache.
+
 Only the standard library is used. The AniList profile list must be public
 (AniList's GraphQL API does not return private lists without an auth token).
 """
@@ -54,9 +58,13 @@ YEAR_BONUS = 0.05        # AniList air year equals a season folder's year
 SEASON_MATCH_BONUS = 0.1
 SEASON_MISMATCH_PENALTY = 0.15
 SEASON_ONE_BONUS = 0.02  # when the name has no season, prefer season 1 among similar entries
-MAX_QUERIES = 6          # AniList searches per series
+MAX_QUERIES = 6          # search variants tried per series
+BATCH_SIZE = 5           # searches sent in one AniList request
 REQUEST_DELAY = 0.8      # AniList allows ~90 requests/minute
-CACHE_VERSION = "v4"     # bump when the fields requested from AniList change
+CACHE_VERSION = "v5"     # bump when the cache layout or the fields requested change
+DEFAULT_CACHE_DAYS = 7   # how long search and media results are reused
+WATCHED_MAX_AGE = 3600   # the watched list is re-fetched after an hour
+CACHE_KEEP_DAYS = 30     # entries older than this are dropped when the cache is saved
 TAG_MIN_RANK = 60        # ignore AniList tags ranked below this (they are often noise)
 
 FORMAT_ORDER = ["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC"]
@@ -235,7 +243,7 @@ def graphql(query: str, variables: dict[str, Any], retries: int = 4) -> dict[str
                 payload = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < retries - 1:
-                wait = int(e.headers.get("Retry-After", "60"))
+                wait = int(e.headers.get("Retry-After") or 60)
                 print(f"  rate limited by AniList, waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
@@ -264,14 +272,6 @@ MEDIA_FIELDS = """
   tags { name rank }
 """
 
-SEARCH_QUERY = f"""
-query ($search: String) {{
-  Page(perPage: 8) {{
-    media(search: $search, type: ANIME, sort: SEARCH_MATCH) {{ {MEDIA_FIELDS} }}
-  }}
-}}
-"""
-
 MEDIA_BY_ID_QUERY = f"""
 query ($id: Int) {{
   Media(id: $id, type: ANIME) {{ {MEDIA_FIELDS} }}
@@ -288,6 +288,16 @@ query ($name: String) {
   }
 }
 """
+
+
+def build_batch_search(n: int) -> str:
+    """One GraphQL request that runs n searches, as aliased fields s0..s{n-1}."""
+    variables = ", ".join(f"$s{i}: String" for i in range(n))
+    fields = "\n".join(
+        f"s{i}: Page(perPage: 8) {{ media(search: $s{i}, type: ANIME, sort: SEARCH_MATCH) {{ {MEDIA_FIELDS} }} }}"
+        for i in range(n)
+    )
+    return f"query ({variables}) {{\n{fields}\n}}"
 
 
 def fetch_watched_ids(user: str) -> set[int]:
@@ -362,51 +372,116 @@ def query_variants(name: str) -> list[str]:
             if len(cand) >= 3 and cand not in [v for _, v in variants]:
                 variants.append((len(cand), cand))
     variants.sort(key=lambda v: -v[0])
-    return [v for _, v in variants][:MAX_QUERIES]
+    return [v for _, v in variants][:MAX_QUERIES] or [name]
 
 
-def search(name: str, cache: dict[str, Any], use_cache: bool) -> list[dict[str, Any]]:
-    key = f"{CACHE_VERSION}|{name}"
-    if use_cache and key in cache:
-        return cache[key]
-    seen: dict[int, dict[str, Any]] = {}
-    for query in query_variants(name):
-        results = graphql(SEARCH_QUERY, {"search": query})["Page"]["media"]
-        time.sleep(REQUEST_DELAY)
-        for media in results:
-            seen.setdefault(media["id"], media)
-        # Stop early once a result is clearly the right title.
-        if any(similarity(query, t) >= 0.9 for m in results for t in titles_of(m)):
-            break
-    merged = list(seen.values())
-    cache[key] = merged
-    return merged
+def is_strong_hit(query: str, results: list[dict[str, Any]]) -> bool:
+    """True when one of the results is clearly the title that was searched for."""
+    return any(similarity(query, t) >= 0.9 for m in results for t in titles_of(m))
 
 
-def load_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-
+# ---------------------------------------------------------------- cache
 
 def load_cache(path: Path) -> dict[str, Any]:
-    return load_json(path) or {}
+    data = load_json(path)
+    return data if isinstance(data, dict) else {}
 
 
 def save_cache(path: Path, cache: dict[str, Any]) -> None:
+    """Write the cache atomically, dropping entries older than CACHE_KEEP_DAYS."""
+    cutoff = time.time() - CACHE_KEEP_DAYS * 86400
+    for key in [k for k, v in cache.items() if not isinstance(v, dict) or v.get("t", 0) < cutoff]:
+        del cache[key]
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cache, indent=1))
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, indent=1))
+        os.replace(tmp, path)
     except OSError as e:
         print(f"warning: could not write cache: {e}", file=sys.stderr)
 
 
-def load_aliases(path: Path) -> dict[str, str | int]:
-    data = load_json(path)
-    if not isinstance(data, dict):
-        return {}
-    return {norm_key(k): v for k, v in data.items() if isinstance(v, (str, int))}
+def is_fresh(cache: dict[str, Any], key: str, max_age: float) -> bool:
+    entry = cache.get(key)
+    return isinstance(entry, dict) and time.time() - entry.get("t", 0) < max_age
+
+
+def put_cache(cache: dict[str, Any], key: str, value: Any) -> None:
+    cache[key] = {"t": time.time(), "v": value}
+
+
+def fetch_watched_cached(user: str, cache: dict[str, Any], use_cache: bool) -> set[int]:
+    key = f"{CACHE_VERSION}|watched|{user.lower()}"
+    if use_cache and is_fresh(cache, key, WATCHED_MAX_AGE):
+        return set(cache[key]["v"])
+    watched = fetch_watched_ids(user)
+    put_cache(cache, key, sorted(watched))
+    return watched
+
+
+def media_by_id_cached(media_id: int, cache: dict[str, Any], use_cache: bool, max_age: float) -> dict[str, Any]:
+    key = f"{CACHE_VERSION}|media|{media_id}"
+    if use_cache and is_fresh(cache, key, max_age):
+        return cache[key]["v"]
+    media = graphql(MEDIA_BY_ID_QUERY, {"id": media_id})["Media"]
+    put_cache(cache, key, media)
+    time.sleep(REQUEST_DELAY)
+    return media
+
+
+def fetch_search_results(names: list[str], cache: dict[str, Any], use_cache: bool, max_age: float,
+                         save: Callable[[], None]) -> dict[str, list[dict[str, Any]]]:
+    """Search AniList for each name. Uncached names are searched in batches, several per request.
+    Each name tries its query variants in turn until one clearly matches. The cache is saved after
+    every batch, so an interrupted run keeps its progress."""
+    results: dict[str, list[dict[str, Any]]] = {}
+    plans: dict[str, list[str]] = {}
+    for name in dict.fromkeys(names):
+        key = f"{CACHE_VERSION}|search|{name}"
+        if use_cache and is_fresh(cache, key, max_age):
+            results[name] = cache[key]["v"]
+        else:
+            plans[name] = query_variants(name)
+    print(f"  {len(results)} searches from cache, {len(plans)} to fetch from AniList")
+    if not plans:
+        return results
+
+    found: dict[str, dict[int, dict[str, Any]]] = {n: {} for n in plans}
+    active = list(plans)
+    depth = 0
+    while active:
+        # The query for each active name at this depth; each batch is one request.
+        todo = [(n, plans[n][depth]) for n in active if depth < len(plans[n])]
+        hits: set[str] = set()
+        finished: set[str] = set()
+        for start in range(0, len(todo), BATCH_SIZE):
+            chunk = todo[start:start + BATCH_SIZE]
+            variables = {f"s{i}": query for i, (_, query) in enumerate(chunk)}
+            data = graphql(build_batch_search(len(chunk)), variables)
+            for i, (name, query) in enumerate(chunk):
+                media = data[f"s{i}"]["media"]
+                for m in media:
+                    found[name].setdefault(m["id"], m)
+                if is_strong_hit(query, media):
+                    hits.add(name)
+            # Save each batch as it arrives, so a failure later keeps what is already fetched.
+            for name, _ in chunk:
+                if name in hits:
+                    results[name] = list(found[name].values())
+                    put_cache(cache, f"{CACHE_VERSION}|search|{name}", results[name])
+                    finished.add(name)
+            save()
+            time.sleep(REQUEST_DELAY)
+
+        for name in active:
+            if name not in finished and depth + 1 >= len(plans[name]):
+                results[name] = list(found[name].values())
+                put_cache(cache, f"{CACHE_VERSION}|search|{name}", results[name])
+                finished.add(name)
+        active = [n for n in active if n not in finished]
+        depth += 1
+        save()
+    return results
 
 
 # ---------------------------------------------------------------- filtering and sorting
@@ -604,7 +679,6 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                 state.reset_sort(next(iter(result)))
 
         def details(media: dict[str, Any], s: Series) -> None:
-            stdscr.erase()
             t = media["title"]
             lines = [
                 ("AniList", display_name(media)),
@@ -714,6 +788,20 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
 
 # ---------------------------------------------------------------- main
 
+def load_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def load_aliases(path: Path) -> dict[str, str | int]:
+    data = load_json(path)
+    if not isinstance(data, dict):
+        return {}
+    return {norm_key(k): v for k, v in data.items() if isinstance(v, (str, int))}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("directory", type=Path, help="directory containing your downloaded anime")
@@ -722,8 +810,10 @@ def main() -> int:
     parser.add_argument("-n", "--limit", type=int, default=0,
                         help="without the TUI, only print the top N suggestions (default: all)")
     parser.add_argument("--no-tui", action="store_true", help="print a plain table instead of the interactive list")
-    parser.add_argument("--refresh", action="store_true", help="ignore cached AniList search results")
-    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="search cache file")
+    parser.add_argument("--refresh", action="store_true", help="ignore cached AniList results and the watched list")
+    parser.add_argument("--cache-days", type=float, default=DEFAULT_CACHE_DAYS,
+                        help=f"how many days AniList results are reused (default: {DEFAULT_CACHE_DAYS})")
+    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache file")
     parser.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES,
                         help="JSON file mapping local names to AniList titles or IDs")
     args = parser.parse_args()
@@ -739,34 +829,43 @@ def main() -> int:
         return 0
     print(f"Found {len(series)} series in {args.directory}")
 
+    use_cache = not args.refresh
+    max_age = args.cache_days * 86400
+    cache = load_cache(args.cache)
+
+    def save() -> None:
+        save_cache(args.cache, cache)
+
     try:
         print(f"Fetching watched list for '{args.user}'...")
-        watched = fetch_watched_ids(args.user)
+        watched = fetch_watched_cached(args.user, cache, use_cache)
         print(f"  {len(watched)} watched entries on AniList")
-    except AniListError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
 
-    aliases = load_aliases(args.aliases)
-    cache = load_cache(args.cache)
-    to_watch: list[tuple[Series, dict[str, Any]]] = []
-    already: list[tuple[Series, dict[str, Any]]] = []
-    unmatched: list[Series] = []
-
-    try:
-        ordered = sorted(series.values(), key=lambda s: (s.name.lower(), s.season or 0))
-        for i, s in enumerate(ordered, 1):
-            print(f"\r  matching {i}/{len(ordered)}: {s.label[:40]:<40}", end="", flush=True)
+        # Work out how each series is looked up: by alias ID, by alias title, or by its own name.
+        aliases = load_aliases(args.aliases)
+        by_id: dict[int, int] = {}  # keyed by id(series): Series is not hashable
+        for s in series.values():
             # A season-specific key ("Name S2") wins over a name-only key, which applies to every season.
             alias = aliases.get(norm_key(s.label))
             if alias is None:
                 alias = aliases.get(norm_key(s.name))
             if isinstance(alias, int):
-                media = graphql(MEDIA_BY_ID_QUERY, {"id": alias})["Media"]
+                by_id[id(s)] = alias
+            elif isinstance(alias, str):
+                s.query = alias
+
+        names = [s.query for s in series.values() if id(s) not in by_id]
+        print(f"Looking up {len(series)} series on AniList...")
+        results = fetch_search_results(names, cache, use_cache, max_age, save)
+
+        to_watch: list[tuple[Series, dict[str, Any]]] = []
+        already: list[tuple[Series, dict[str, Any]]] = []
+        unmatched: list[Series] = []
+        for s in sorted(series.values(), key=lambda s: (s.name.lower(), s.season or 0)):
+            if id(s) in by_id:
+                media = media_by_id_cached(by_id[id(s)], cache, use_cache, max_age)
             else:
-                if isinstance(alias, str):
-                    s.query = alias
-                media = best_match(s, search(s.query, cache, use_cache=not args.refresh))
+                media = best_match(s, results.get(s.query, []))
             if media is None:
                 unmatched.append(s)
             elif media["id"] in watched:
@@ -774,11 +873,10 @@ def main() -> int:
             else:
                 to_watch.append((s, media))
     except AniListError as e:
-        print(f"\nerror: {e}", file=sys.stderr)
-        save_cache(args.cache, cache)
+        print(f"error: {e}", file=sys.stderr)
+        save()
         return 1
-    print()
-    save_cache(args.cache, cache)
+    save()
 
     to_watch.sort(key=lambda r: (-(r[1].get("averageScore") or 0), r[0].label.lower()))
     already.sort(key=lambda r: r[0].label.lower())
