@@ -3,8 +3,9 @@
 
 Scans a directory for video files, works out the series, season and episode
 number of each file from its name, looks the series up on AniList, and removes
-everything that appears in your AniList list with a watched status. What is
-left is shown in an interactive list where you can filter by format or tag,
+the shows on your AniList list. The interactive list starts with Planning, Watching
+and Not on list shown; you can filter by any AniList status (Completed, Dropped, ...),
+format or tag, change the sort,
 change the sort, see which episodes you have, and play them.
 
 Understands folders sorted by season ("2024-winter", "2023-fall", "2022-movies",
@@ -19,7 +20,7 @@ use the season in the key, e.g. {"Aharen Is Indecipherable S2": 179979}; a key
 without a season applies to every season.
 
 Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
-c clear filters, x random pick, Enter details, q quit.
+l list status, c clear filters, x random pick, Enter details, q quit.
 In details: j/k pick a file, Enter plays it, o opens the folder, any other key goes back.
 
 Playback uses mpv, then vlc, then xdg-open, whichever is installed. Set
@@ -62,8 +63,14 @@ from typing import Any, Callable
 ANILIST_URL = "https://graphql.anilist.co"
 USER_AGENT = "anifinder/0.1"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".webm", ".mov", ".wmv", ".ts"}
-# AniList list statuses that count as "already watched"
-WATCHED_STATUSES = {"COMPLETED", "CURRENT", "REPEATING", "PAUSED", "DROPPED"}
+# Your AniList list statuses that the status filter selects when the program starts.
+# Every status can be filtered in the TUI (press l).
+DEFAULT_LIST_STATUSES = {"NOT_ON_LIST", "PLANNING", "CURRENT"}
+STATUS_LABELS = {
+    "NOT_ON_LIST": "Not on list", "PLANNING": "Planning", "CURRENT": "Watching",
+    "PAUSED": "Paused", "REPEATING": "Rewatching", "DROPPED": "Dropped", "COMPLETED": "Completed",
+}
+STATUS_ORDER = ["NOT_ON_LIST", "PLANNING", "CURRENT", "PAUSED", "REPEATING", "DROPPED", "COMPLETED"]
 MATCH_THRESHOLD = 0.6
 FORMAT_BONUS = {"TV": 0.1, "TV_SHORT": 0.1, "ONA": 0.05}
 YEAR_BONUS = 0.05        # AniList air year equals a season folder's year
@@ -424,16 +431,17 @@ def build_batch_search(n: int) -> str:
     return f"query ({variables}) {{\n{fields}\n}}"
 
 
-def fetch_watched_ids(user: str) -> set[int]:
+def fetch_list_statuses(user: str) -> dict[int, str]:
+    """Your list status for every anime on the user's public list: {media id: status}."""
     data = graphql(WATCHED_QUERY, {"name": user})
     collection = data.get("MediaListCollection") or {}
-    watched: set[int] = set()
+    statuses: dict[int, str] = {}
     for lst in collection.get("lists", []):
         for entry in lst.get("entries", []):
             status = entry.get("status") or lst.get("status")
-            if status in WATCHED_STATUSES:
-                watched.add(entry["media"]["id"])
-    return watched
+            if status:
+                statuses[entry["media"]["id"]] = status
+    return statuses
 
 
 def media_year(media: dict[str, Any]) -> int | None:
@@ -637,13 +645,13 @@ def put_cache(cache: dict[str, Any], key: str, value: Any) -> None:
     cache[key] = {"t": time.time(), "v": value}
 
 
-def fetch_watched_cached(user: str, cache: dict[str, Any], use_cache: bool) -> set[int]:
-    key = f"{CACHE_VERSION}|watched|{user.lower()}"
+def fetch_statuses_cached(user: str, cache: dict[str, Any], use_cache: bool) -> dict[int, str]:
+    key = f"{CACHE_VERSION}|statuses|{user.lower()}"
     if use_cache and is_fresh(cache, key, WATCHED_MAX_AGE):
-        return set(cache[key]["v"])
-    watched = fetch_watched_ids(user)
-    put_cache(cache, key, sorted(watched))
-    return watched
+        return {int(k): v for k, v in cache[key]["v"].items()}
+    statuses = fetch_list_statuses(user)
+    put_cache(cache, key, {str(k): v for k, v in statuses.items()})
+    return statuses
 
 
 def media_by_id_cached(media_id: int, cache: dict[str, Any], use_cache: bool, max_age: float) -> dict[str, Any]:
@@ -743,6 +751,7 @@ class ViewState:
     tag_mode: str = "any"                            # "any": match one selected tag, "all": match every one
     sort_key: str = "score"
     desc: bool = True
+    statuses: set[str] = field(default_factory=lambda: set(DEFAULT_LIST_STATUSES))  # empty = all statuses
 
     def reset_sort(self, key: str) -> None:
         self.sort_key = key
@@ -752,12 +761,20 @@ class ViewState:
         self.formats.clear()
         self.tags.clear()
         self.tag_mode = "any"
+        self.statuses = set(DEFAULT_LIST_STATUSES)
 
 
-def apply_view(rows: list[tuple[Series, dict[str, Any]]], state: ViewState) -> list[tuple[Series, dict[str, Any]]]:
+def list_status(statuses: dict[int, str], media: dict[str, Any]) -> str:
+    return statuses.get(media["id"], "NOT_ON_LIST")
+
+
+def apply_view(rows: list[tuple[Series, dict[str, Any]]], state: ViewState,
+               statuses: dict[int, str]) -> list[tuple[Series, dict[str, Any]]]:
     out = []
     for s, media in rows:
         if state.formats and (media.get("format") or "") not in state.formats:
+            continue
+        if state.statuses and list_status(statuses, media) not in state.statuses:
             continue
         if state.tags:
             tags = row_tags(media)
@@ -781,6 +798,13 @@ def available_tags(rows: list[tuple[Series, dict[str, Any]]], limit: int = 80) -
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
+def available_statuses(rows: list[tuple[Series, dict[str, Any]]],
+                       statuses: dict[int, str]) -> list[tuple[str, int]]:
+    """Every AniList status, with how many of these rows have it."""
+    counts = Counter(list_status(statuses, m) for _, m in rows)
+    return [(st, counts[st]) for st in STATUS_ORDER]
+
+
 def episode_coverage(s: Series, total: int | None) -> tuple[str, str]:
     """(episodes you have, episodes missing) as text, using the AniList episode count when known."""
     have = sorted({f.episode for f in s.episode_files if f.episode is not None})
@@ -798,21 +822,24 @@ def episode_coverage(s: Series, total: int | None) -> tuple[str, str]:
 
 # ---------------------------------------------------------------- output
 
-def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
+def print_table(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str]) -> None:
     if not rows:
         print("  (none)")
         return
-    header = f"  {'Local name':<34} {'Folder':<12} {'AniList name':<40} {'Score':>5} {'Eps':>5} {'Files':>5}  Format"
+    header = (f"  {'Local name':<34} {'Folder':<12} {'AniList name':<40} {'Status':<12} "
+              f"{'Score':>5} {'Eps':>5} {'Files':>5}  Format")
     print(header)
     print("  " + "-" * (len(header) - 2))
     for s, media in rows:
         score = media.get("averageScore")
         eps = media.get("episodes")
         folder = ",".join(sorted(s.labels))[:12] or "-"
+        status = STATUS_LABELS[list_status(statuses, media)]
         print(
             f"  {s.label[:34]:<34} "
             f"{folder:<12} "
             f"{display_name(media)[:40]:<40} "
+            f"{status:<12} "
             f"{(str(score) if score else '-'):>5} "
             f"{(str(eps) if eps else '?'):>5} "
             f"{s.files:>5}  {media.get('format') or '-'}"
@@ -821,7 +848,8 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
 
 # ---------------------------------------------------------------- TUI
 
-def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, login_note: str = "") -> None:
+def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
+            session: Session | None, login_note: str = "") -> None:
     import curses  # imported here so the rest of the tool does not need a terminal
 
     def app(stdscr: "curses.window") -> None:
@@ -931,6 +959,13 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, 
             )
             if result is not None:
                 state.tags = result
+
+        def pick_statuses() -> None:
+            items = [(st, f"{STATUS_LABELS[st]} ({n})") for st, n in available_statuses(rows, statuses)]
+            result = checklist(lambda: "Filter by your list status (space to toggle, enter to apply; "
+                                       "none selected = all)", items, state.statuses)
+            if result is not None:
+                state.statuses = result
 
         def pick_sort() -> None:
             items = [(k, label) for k, (label, _, _) in SORT_OPTIONS.items()]
@@ -1058,7 +1093,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, 
                     return
 
         while True:
-            view = apply_view(rows, state)
+            view = apply_view(rows, state, statuses)
             h, w = stdscr.getmaxyx()
             body = max(1, h - 4)
             cursor = min(cursor, max(0, len(view) - 1))
@@ -1072,11 +1107,13 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, 
             tag_f = (f"{','.join(sorted(state.tags))} ({state.tag_mode})" if state.tags else "all")
             label = SORT_OPTIONS[state.sort_key][0]
             put(0, 0, f"anifinder: {len(view)} of {len(rows)} not watched", curses.A_BOLD)
-            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | sort: {label} {'desc' if state.desc else 'asc'}")
+            status_f = ", ".join(STATUS_LABELS[st] for st in STATUS_ORDER if st in state.statuses) or "all"
+            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | list: {status_f} | sort: {label} "
+                      f"{'desc' if state.desc else 'asc'}")
 
-            aw = max(8, w - 66)
-            put(2, 0, f"{'#':>4}  {'Local name':<28}  {'AniList name':<{aw}}  {'Scr':>3}  {'Eps':>3}  {'Year':>4}  Format",
-                curses.A_UNDERLINE)
+            aw = max(8, w - 80)
+            put(2, 0, f"{'#':>4}  {'Local name':<28}  {'AniList name':<{aw}}  {'Status':<12}  "
+                      f"{'Scr':>3}  {'Eps':>3}  {'Year':>4}  Format", curses.A_UNDERLINE)
             if not view:
                 put(4, 2, "No entries match the current filters. Press c to clear them.")
             for i, (s, media) in enumerate(view[top: top + body]):
@@ -1084,11 +1121,12 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, 
                 score = media.get("averageScore") or "-"
                 eps = media.get("episodes") or "?"
                 year = media_year(media) or "-"
-                line = (f"{pos + 1:>4}  {s.label[:28]:<28}  {display_name(media)[:aw]:<{aw}}  "
+                status = STATUS_LABELS[list_status(statuses, media)]
+                line = (f"{pos + 1:>4}  {s.label[:28]:<28}  {display_name(media)[:aw]:<{aw}}  {status:<12}  "
                         f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {media.get('format') or '-'}")
                 put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
             put(h - 2, 0, message)
-            put(h - 1, 0, "j/k move  f formats  t tags  s sort  r reverse  c clear  x random  enter details  q quit")
+            put(h - 1, 0, "j/k move  f formats  t tags  l status  s sort  r reverse  c clear  x random  enter details  q quit")
             stdscr.refresh()
             message = ""
 
@@ -1112,6 +1150,9 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, 
                 cursor = 0
             elif key == ord("t"):
                 pick_tags()
+                cursor = 0
+            elif key == ord("l"):
+                pick_statuses()
                 cursor = 0
             elif key == ord("s"):
                 pick_sort()
@@ -1189,9 +1230,9 @@ def main() -> int:
         save_cache(args.cache, cache)
 
     try:
-        print(f"Fetching watched list for '{args.user}'...")
-        watched = fetch_watched_cached(args.user, cache, use_cache)
-        print(f"  {len(watched)} watched entries on AniList")
+        print(f"Fetching list for '{args.user}'...")
+        statuses = fetch_statuses_cached(args.user, cache, use_cache)
+        print(f"  {len(statuses)} entries on AniList")
 
         # Work out how each series is looked up: by alias ID, by alias title, or by its own name.
         aliases = load_aliases(args.aliases)
@@ -1211,7 +1252,6 @@ def main() -> int:
         results = fetch_search_results(names, cache, use_cache, max_age, save)
 
         to_watch: list[tuple[Series, dict[str, Any]]] = []
-        already: list[tuple[Series, dict[str, Any]]] = []
         unmatched: list[Series] = []
         for s in sorted(series.values(), key=lambda s: (s.name.lower(), s.season or 0)):
             if id(s) in by_id:
@@ -1220,8 +1260,6 @@ def main() -> int:
                 media = best_match(s, results.get(s.query, []))
             if media is None:
                 unmatched.append(s)
-            elif media["id"] in watched:
-                already.append((s, media))
             else:
                 to_watch.append((s, media))
     except AniListError as e:
@@ -1231,10 +1269,9 @@ def main() -> int:
     save()
 
     to_watch.sort(key=lambda r: (-(r[1].get("averageScore") or 0), r[0].label.lower()))
-    already.sort(key=lambda r: r[0].label.lower())
-
-    print(f"\nAlready watched, skipped ({len(already)}):")
-    print("  " + ", ".join(f"{s.label} = {display_name(m)}" for s, m in already) if already else "  (none)")
+    shown_default = [r for r in to_watch if list_status(statuses, r[1]) in DEFAULT_LIST_STATUSES]
+    print(f"\nOn your list: {len(to_watch)} matched; {len(shown_default)} shown by default "
+          f"(Planning, Watching, Not on list). The rest are in the status filter.")
 
     print(f"\nCould not match on AniList ({len(unmatched)}), check the names:")
     print("  " + ", ".join(s.label for s in unmatched) if unmatched else "  (none)")
@@ -1243,16 +1280,18 @@ def main() -> int:
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.no_tui
     if not to_watch:
-        print("\nNothing left to watch.")
+        print("\nNothing matched.")
     elif interactive:
         session, login_note = load_session()
-        run_tui(to_watch, session, login_note)
+        run_tui(to_watch, statuses, session, login_note)
+    elif not shown_default:
+        print("\nNothing to show by default. Run in a terminal and press l to pick other statuses.")
     else:
-        shown = to_watch[: args.limit] if args.limit else to_watch
-        print(f"\nNot watched yet ({len(to_watch)}), best rated first:")
-        print_table(shown)
-        if args.limit and len(to_watch) > args.limit:
-            print(f"  ... {len(to_watch) - args.limit} more (use without --limit to see all)")
+        shown = shown_default[: args.limit] if args.limit else shown_default
+        print(f"\nShown by default ({len(shown_default)}), best rated first:")
+        print_table(shown, statuses)
+        if args.limit and len(shown_default) > args.limit:
+            print(f"  ... {len(shown_default) - args.limit} more (use without --limit to see all)")
     return 0
 
 
