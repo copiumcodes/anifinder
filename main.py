@@ -23,6 +23,8 @@ Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
 l list status, d also shows entries with no local files, c clear filters, x random pick,
 Enter details, q quit. --include-missing starts with that option on.
 In details: j/k pick a file, Enter plays it, o opens the folder, any other key goes back.
+The details view lists the audio and subtitle tracks of the selected file. This needs
+mediainfo to be installed; --tracks does the same for each episode with --no-tui.
 
 Playback uses mpv, then vlc, then xdg-open, whichever is installed. Set
 ANIFINDER_PLAYER to use another program (its arguments are allowed).
@@ -57,7 +59,8 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,6 +76,7 @@ STATUS_LABELS = {
 }
 STATUS_ORDER = ["NOT_ON_LIST", "PLANNING", "CURRENT", "PAUSED", "REPEATING", "DROPPED", "COMPLETED"]
 MATCH_THRESHOLD = 0.6
+TRACK_REFRESH_MS = 250   # how often the list redraws while mediainfo is still reading files
 FORMAT_BONUS = {"TV": 0.1, "TV_SHORT": 0.1, "ONA": 0.05}
 YEAR_BONUS = 0.05        # AniList air year equals a season folder's year
 SEASON_MATCH_BONUS = 0.1
@@ -647,6 +651,36 @@ def put_cache(cache: dict[str, Any], key: str, value: Any) -> None:
     cache[key] = {"t": time.time(), "v": value}
 
 
+# Episode titles that streaming sites give AniList, e.g. {"title": "Episode 5 - The Title"}.
+EPISODE_TITLES_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) { streamingEpisodes { title } }
+}
+"""
+EPISODE_TITLE_RE = re.compile(r"^\s*(?:episode|ep)?\s*(\d{1,4})\s*[-–:]\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def parse_episode_titles(entries: list[dict[str, Any]]) -> dict[int, str]:
+    """{episode number: title} from AniList streaming episodes. Entries without a number are skipped."""
+    titles: dict[int, str] = {}
+    for e in entries:
+        m = EPISODE_TITLE_RE.match(e.get("title") or "")
+        if m:
+            titles.setdefault(int(m.group(1)), m.group(2))
+    return titles
+
+
+def fetch_episode_titles(media_id: int, cache: dict[str, Any], use_cache: bool, max_age: float) -> dict[int, str]:
+    """Episode titles for one anime, cached like the other AniList results. Raises AniListError on failure."""
+    key = f"{CACHE_VERSION}|episodes|{media_id}"
+    if use_cache and is_fresh(cache, key, max_age):
+        return {int(k): v for k, v in cache[key]["v"].items()}
+    data = graphql(EPISODE_TITLES_QUERY, {"id": media_id})["Media"] or {}
+    titles = parse_episode_titles(data.get("streamingEpisodes") or [])
+    put_cache(cache, key, {str(k): v for k, v in titles.items()})
+    return titles
+
+
 def fetch_entries_cached(user: str, cache: dict[str, Any], use_cache: bool) -> dict[int, dict[str, Any]]:
     key = f"{CACHE_VERSION}|entries|{user.lower()}"
     if use_cache and is_fresh(cache, key, WATCHED_MAX_AGE):
@@ -825,7 +859,219 @@ def episode_coverage(s: Series, total: int | None) -> tuple[str, str]:
     return have_text, missing_text
 
 
+# ---------------------------------------------------------------- media tracks
+
+@dataclass
+class Track:
+    label: str        # "Audio 1", "Subs 2"
+    language: str
+    codec: str
+    detail: str       # channel count for audio, empty for subtitles
+    title: str
+    flags: list[str]  # "default", "forced"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.label.startswith("Audio")
+
+
+@dataclass
+class FileInfo:
+    tracks: list[Track]
+
+
+def file_key(path: Path) -> str | None:
+    """Cache key for a file's tracks. It changes when the file's size or modification time changes."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return f"{CACHE_VERSION}|tracks3|{path}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def probe_file(path: Path) -> FileInfo | None:
+    """Read a file's audio and subtitle tracks with mediainfo. Runs in a worker thread.
+    None when mediainfo cannot read the file."""
+    exe = shutil.which("mediainfo")
+    if exe is None:
+        return None
+    # Lowest CPU and disk priority when the tools exist, so the list stays responsive.
+    prefix: list[str] = []
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c3"]
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "19"]
+    try:
+        out = subprocess.run([*prefix, exe, "--Output=JSON", str(path)], capture_output=True, text=True,
+                             timeout=60, check=True).stdout
+        raw = json.loads(out)["media"]["track"]
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
+        return None
+    tracks: list[Track] = []
+    counts = {"Audio": 0, "Text": 0}
+    for t in raw:
+        kind = t.get("@type")
+        if kind not in counts:
+            continue
+        counts[kind] += 1
+        label = f"Audio {counts[kind]}" if kind == "Audio" else f"Subs {counts[kind]}"
+        channels = t.get("Channels")
+        tracks.append(Track(
+            label=label,
+            language=t.get("Language") or "-",
+            codec=t.get("Format") or "-",
+            detail=f"{channels} ch" if kind == "Audio" and channels else "",
+            title=t.get("Title") or "",
+            flags=[name for name, key in (("default", "Default"), ("forced", "Forced")) if t.get(key) == "Yes"],
+        ))
+    return FileInfo(tracks)
+
+
+class TrackStore:
+    """Audio and subtitle tracks of episode files. mediainfo runs in background threads, and every
+    result (failures too) goes into the cache, so later runs only read files that are new or changed."""
+
+    def __init__(self, cache: dict[str, Any], use_cache: bool) -> None:
+        self.cache = cache
+        self.use_cache = use_cache
+        self.available = shutil.which("mediainfo") is not None
+        self.known: dict[Path, FileInfo | None] = {}  # None: could not be read
+        self.pending: dict[Path, Future[FileInfo | None]] = {}
+        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mediainfo") if self.available else None
+
+    def get(self, path: Path) -> tuple[bool, FileInfo | None]:
+        """(ready, info). Never waits: a file not ready yet is queued for reading."""
+        if not self.available:
+            return True, None
+        if path in self.known:
+            return True, self.known[path]
+        if path in self.pending:
+            return False, None
+        key = file_key(path)
+        if key and self.use_cache:
+            entry = self.cache.get(key)
+            if isinstance(entry, dict) and "v" in entry:
+                value = entry["v"]
+                self.known[path] = (FileInfo([Track(**d) for d in value["tracks"]])
+                                    if value is not None else None)
+                return True, self.known[path]
+        if self.pool is not None:
+            self.pending[path] = self.pool.submit(probe_file, path)
+        return False, None
+
+    def busy(self) -> bool:
+        return bool(self.pending)
+
+    def poll(self) -> bool:
+        """Take in finished reads and put them in the cache. Returns True if any finished."""
+        changed = False
+        for path, fut in list(self.pending.items()):
+            if not fut.done():
+                continue
+            del self.pending[path]
+            try:
+                info = fut.result()
+            except Exception:
+                info = None
+            self.known[path] = info
+            key = file_key(path)
+            if key:
+                value = None if info is None else {"tracks": [asdict(t) for t in info.tracks]}
+                put_cache(self.cache, key, value)
+            changed = True
+        return changed
+
+    def wait(self, path: Path) -> FileInfo | None:
+        """Blocking read, for the plain-text output."""
+        ready, info = self.get(path)
+        if not ready:
+            self.pending[path].result()
+            self.poll()
+            info = self.known.get(path)
+        return info
+
+    def shutdown(self) -> None:
+        if self.pool is not None:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def langs_of(info: FileInfo, audio: bool) -> str:
+    langs = dict.fromkeys(t.language for t in info.tracks if t.is_audio == audio and t.language != "-")
+    return ",".join(langs) or "none"
+
+
+def file_row(store: TrackStore, f: EpisodeFile, titles: dict[int, str]) -> tuple[str, str, str, str]:
+    """(episode, title from AniList, audio languages, subtitle languages) for one file in the details table."""
+    ep = f"E{f.episode:02d}" if f.episode is not None else "-"
+    ready, info = store.get(f.path)
+    title = titles.get(f.episode, "") if f.episode is not None else ""
+    if not store.available:
+        return ep, title, "-", "-"
+    if not ready:
+        return ep, title, "...", "..."
+    if info is None:
+        return ep, title, "?", "?"
+    return ep, title, langs_of(info, True), langs_of(info, False)
+
+
+def track_column(store: TrackStore, s: Series, audio: bool) -> str:
+    """Languages of a series' audio (or subtitle) tracks across its downloaded files, e.g. 'ja,en'."""
+    if not store.available or not s.episode_files:
+        return "-"
+    langs: set[str] = set()
+    waiting = unreadable = 0
+    for f in s.episode_files:
+        ready, info = store.get(f.path)
+        if not ready:
+            waiting += 1
+        elif info is None:
+            unreadable += 1
+        else:
+            langs.update(t.language for t in info.tracks if t.is_audio == audio and t.language != "-")
+    text = ",".join(sorted(langs))
+    if waiting:
+        text = f"{text} ..." if text else "..."
+    if not text:
+        text = "?" if unreadable else "none"
+    return text
+
+
+def describe_tracks(store: TrackStore, path: Path) -> list[str]:
+    """Display lines for a file's audio and subtitle tracks, for --tracks."""
+    if not store.available:
+        return ["mediainfo is not installed, so tracks are not shown"]
+    info = store.wait(path)
+    if info is None:
+        return ["mediainfo could not read this file"]
+    if not info.tracks:
+        return ["no audio or subtitle tracks found"]
+    lines = []
+    for t in info.tracks:
+        parts = [f"{t.label:<8}", f"{t.language:<5}", f"{t.codec:<12}", f"{t.detail:<6}"]
+        if t.title:
+            parts.append(f'"{t.title}"')
+        parts.extend(t.flags)
+        lines.append("  ".join(p for p in (p.rstrip() for p in parts) if p))
+    return lines
+
+
 # ---------------------------------------------------------------- output
+
+def print_tracks(store: TrackStore, rows: list[tuple[Series, dict[str, Any]]]) -> None:
+    """Print the audio and subtitle tracks of every downloaded episode in rows."""
+    for s, media in rows:
+        for f in s.episode_files:
+            store.get(f.path)  # start reading everything at once
+    for s, media in rows:
+        if not s.episode_files:
+            continue
+        print(f"\n{s.label} ({display_name(media)})")
+        for f in s.episode_files:
+            ep = f"E{f.episode:02d}" if f.episode is not None else "  -"
+            print(f"  {ep}  {f.path.name}")
+            for line in describe_tracks(store, f.path):
+                print(f"        {line}")
+
 
 def print_table(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str]) -> None:
     if not rows:
@@ -854,7 +1100,10 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, s
 # ---------------------------------------------------------------- TUI
 
 def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
-            session: Session | None, login_note: str = "", include_missing: bool = False) -> None:
+            session: Session | None, login_note: str = "", include_missing: bool = False,
+            track_store: TrackStore | None = None, save: Callable[[], None] = lambda: None,
+            fetch_titles: Callable[[int], dict[int, str]] = lambda media_id: {}) -> None:
+    store = track_store or TrackStore({}, use_cache=False)
     import curses  # imported here so the rest of the tool does not need a terminal
 
     def app(stdscr: "curses.window") -> None:
@@ -1034,58 +1283,85 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             total = media.get("episodes")
             have_text, missing_text = episode_coverage(s, total)
             entry_info = [describe_entry(media, session)]
+            titles = fetch_titles(media["id"])
             file_cursor = 0
             file_top = 0
             note = ""
+            need_draw = True
             while True:
-                info = [
-                    ("AniList", display_name(media)),
-                    ("Romaji", t.get("romaji") or "-"),
-                    ("Native", t.get("native") or "-"),
-                    ("Local name", s.label),
-                    ("Local files", str(s.files)),
-                    ("Folder", ", ".join(sorted(s.labels)) or "-"),
-                    ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
-                    ("Format", media.get("format") or "-"),
-                    ("Episodes", f"{total or '?'} on AniList"),
-                    ("Have", have_text),
-                    ("Missing", missing_text),
-                    ("Your list", entry_info[0]),
-                    ("Score", str(media.get("averageScore") or "-")),
-                    ("Year", str(media_year(media) or "-")),
-                    ("Genres", ", ".join(media.get("genres") or []) or "-"),
-                ]
-                tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
-                              key=lambda t: -(t.get("rank") or 0))
-                info.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
-                info.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
+                if store.poll():
+                    need_draw = True
+                    if not store.busy():
+                        save()
+                if need_draw:
+                    need_draw = False
+                    info = [
+                        ("AniList", display_name(media)),
+                        ("Romaji", t.get("romaji") or "-"),
+                        ("Native", t.get("native") or "-"),
+                        ("Local name", s.label),
+                        ("Local files", str(s.files)),
+                        ("Folder", ", ".join(sorted(s.labels)) or "-"),
+                        ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
+                        ("Format", media.get("format") or "-"),
+                        ("Episodes", f"{total or '?'} on AniList"),
+                        ("Have", have_text),
+                        ("Missing", missing_text),
+                        ("Your list", entry_info[0]),
+                        ("Score", str(media.get("averageScore") or "-")),
+                        ("Year", str(media_year(media) or "-")),
+                        ("Genres", ", ".join(media.get("genres") or []) or "-"),
+                    ]
+                    tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
+                                  key=lambda t: -(t.get("rank") or 0))
+                    info.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
+                    info.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
 
-                stdscr.erase()
-                h, w = stdscr.getmaxyx()
-                put(0, 0, "Details", curses.A_BOLD)
-                for i, (k, v) in enumerate(info):
-                    put(2 + i, 2, f"{k}:", curses.A_BOLD)
-                    put(2 + i, 16, v)
-                list_top = 2 + len(info) + 1
-                put(list_top, 2, "Files (enter plays the selected file and updates your progress):", curses.A_BOLD)
-                first_row = list_top + 1
-                visible = max(1, h - 2 - first_row)
-                if file_cursor < file_top:
-                    file_top = file_cursor
-                if file_cursor >= file_top + visible:
-                    file_top = file_cursor - visible + 1
-                if not s.episode_files:
-                    put(first_row, 4, "(no files)")
-                for i, f in enumerate(s.episode_files[file_top: file_top + visible]):
-                    pos = file_top + i
-                    ep = f"E{f.episode:02d}" if f.episode is not None else "  -"
-                    attr = curses.A_REVERSE if pos == file_cursor else 0
-                    put(first_row + i, 4, f"{ep:>4}  {f.path.name}", attr)
-                put(h - 2, 0, note)
-                put(h - 1, 0, "j/k select  enter play  o open folder  any other key: back")
-                stdscr.refresh()
+                    stdscr.erase()
+                    h, w = stdscr.getmaxyx()
+                    put(0, 0, "Details", curses.A_BOLD)
+                    # Two columns of details, to save rows for the file table.
+                    half = (len(info) + 1) // 2
+                    col = max(24, w // 2)
+                    for i, (k, v) in enumerate(info):
+                        row = 2 + i % half
+                        x = 2 if i < half else col
+                        put(row, x, f"{k}:", curses.A_BOLD)
+                        put(row, x + 12, v)
 
+                    table_top = 2 + half + 1
+                    put(table_top, 2, "Files (enter plays the selected file and updates your progress):",
+                        curses.A_BOLD)
+                    head = table_top + 1
+                    first_row = head + 1
+                    visible = max(1, h - 2 - first_row)
+                    if file_cursor < file_top:
+                        file_top = file_cursor
+                    if file_cursor >= file_top + visible:
+                        file_top = file_cursor - visible + 1
+                    # Fixed-width columns: episode, title (takes 2/5 of the rest), audio, subtitles, file name.
+                    rest = max(20, w - 35)
+                    title_w = max(10, rest * 2 // 5)
+                    file_w = max(10, rest - title_w)
+                    fmt = f"{{:<4}}  {{:<{title_w}}}  {{:<10}}  {{:<10}}  {{:<{file_w}}}"
+                    put(head, 2, fmt.format("Ep", "Title", "Audio", "Subs", "File"), curses.A_UNDERLINE)
+                    if not s.episode_files:
+                        put(first_row, 4, "(no files)")
+                    for i, f in enumerate(s.episode_files[file_top: file_top + visible]):
+                        pos = file_top + i
+                        ep, title, audio, subs = file_row(store, f, titles)
+                        attr = curses.A_REVERSE if pos == file_cursor else 0
+                        put(first_row + i, 2, fmt.format(ep, title[:title_w], audio[:10], subs[:10], f.path.name),
+                            attr)
+                    put(h - 2, 0, note)
+                    put(h - 1, 0, "j/k select  enter play  o open folder  any other key: back")
+                    stdscr.refresh()
+
+                stdscr.timeout(TRACK_REFRESH_MS if store.busy() else -1)
                 key = stdscr.getch()
+                if key == -1:  # timed out: redraw only if a background read finished (checked at the top)
+                    continue
+                need_draw = True
                 if key in (curses.KEY_DOWN, ord("j")):
                     file_cursor = min(file_cursor + 1, max(0, len(s.episode_files) - 1))
                 elif key in (curses.KEY_UP, ord("k")):
@@ -1097,7 +1373,13 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
                 else:
                     return
 
+        dirty = True  # redraw only after a key press or when a track read finishes
         while True:
+            if store.poll():
+                dirty = True
+                if not store.busy():
+                    save()
+            stdscr.timeout(TRACK_REFRESH_MS if store.busy() else -1)
             view = apply_view(rows, state, statuses)
             h, w = stdscr.getmaxyx()
             body = max(1, h - 4)
@@ -1107,37 +1389,46 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             if cursor >= top + body:
                 top = cursor - body + 1
 
-            stdscr.erase()
-            fmt_f = ",".join(sorted(state.formats)) or "all"
-            tag_f = (f"{','.join(sorted(state.tags))} ({state.tag_mode})" if state.tags else "all")
-            label = SORT_OPTIONS[state.sort_key][0]
-            put(0, 0, f"anifinder: {len(view)} of {len(rows)} not watched", curses.A_BOLD)
-            status_f = ", ".join(STATUS_LABELS[st] for st in STATUS_ORDER if st in state.statuses) or "all"
-            files_f = "incl. not downloaded" if state.include_missing else "downloaded only"
-            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | list: {status_f} | files: {files_f} | sort: {label} "
-                      f"{'desc' if state.desc else 'asc'}")
+            if dirty:
+                stdscr.erase()
+                fmt_f = ",".join(sorted(state.formats)) or "all"
+                tag_f = (f"{','.join(sorted(state.tags))} ({state.tag_mode})" if state.tags else "all")
+                label = SORT_OPTIONS[state.sort_key][0]
+                put(0, 0, f"anifinder: {len(view)} of {len(rows)} not watched", curses.A_BOLD)
+                status_f = ", ".join(STATUS_LABELS[st] for st in STATUS_ORDER if st in state.statuses) or "all"
+                files_f = "incl. not downloaded" if state.include_missing else "downloaded only"
+                put(1, 0, f"format: {fmt_f} | tags: {tag_f} | list: {status_f} | files: {files_f} | sort: {label} "
+                          f"{'desc' if state.desc else 'asc'}")
 
-            aw = max(8, w - 80)
-            put(2, 0, f"{'#':>4}  {'Local name':<28}  {'AniList name':<{aw}}  {'Status':<12}  "
-                      f"{'Scr':>3}  {'Eps':>3}  {'Year':>4}  Format", curses.A_UNDERLINE)
-            if not view:
-                put(4, 2, "No entries match the current filters. Press c to clear them.")
-            for i, (s, media) in enumerate(view[top: top + body]):
-                pos = top + i
-                score = media.get("averageScore") or "-"
-                eps = media.get("episodes") or "?"
-                year = media_year(media) or "-"
-                status = STATUS_LABELS[list_status(statuses, media)]
-                line = (f"{pos + 1:>4}  {s.label[:28]:<28}  {display_name(media)[:aw]:<{aw}}  {status:<12}  "
-                        f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {media.get('format') or '-'}")
-                put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
-            put(h - 2, 0, message)
-            put(h - 1, 0, "j/k move  f formats  t tags  l status  d not downloaded  s sort  r reverse  c clear  "
-                          "x random  enter details  q quit")
-            stdscr.refresh()
-            message = ""
+                aw = max(8, w - 102)
+                put(2, 0, f"{'#':>4}  {'Local name':<28}  {'AniList name':<{aw}}  {'Status':<12}  "
+                          f"{'Scr':>3}  {'Eps':>3}  {'Year':>4}  {'Audio':<10}  {'Subs':<10}  Format",
+                    curses.A_UNDERLINE)
+                if not view:
+                    put(4, 2, "No entries match the current filters. Press c to clear them.")
+                for i, (s, media) in enumerate(view[top: top + body]):
+                    pos = top + i
+                    score = media.get("averageScore") or "-"
+                    eps = media.get("episodes") or "?"
+                    year = media_year(media) or "-"
+                    status = STATUS_LABELS[list_status(statuses, media)]
+                    audio = track_column(store, s, audio=True)  # also queues the reads for visible rows
+                    subs = track_column(store, s, audio=False)
+                    line = (f"{pos + 1:>4}  {s.label[:28]:<28}  {display_name(media)[:aw]:<{aw}}  {status:<12}  "
+                            f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {audio:<10.10}  {subs:<10.10}  "
+                            f"{media.get('format') or '-'}")
+                    put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
+                put(h - 2, 0, message)
+                put(h - 1, 0, "j/k move  f formats  t tags  l status  d not downloaded  s sort  r reverse  c clear  "
+                              "x random  enter details  q quit")
+                stdscr.refresh()
+                message = ""
+                dirty = False
 
             key = stdscr.getch()
+            if key == -1:  # timed out: only a finished read needs a redraw, handled at the top
+                continue
+            dirty = True
             if key in (ord("q"), 27):
                 return
             if key in (curses.KEY_DOWN, ord("j")):
@@ -1207,6 +1498,8 @@ def main() -> int:
     parser.add_argument("-n", "--limit", type=int, default=0,
                         help="without the TUI, only print the top N suggestions (default: all)")
     parser.add_argument("--no-tui", action="store_true", help="print a plain table instead of the interactive list")
+    parser.add_argument("--tracks", action="store_true",
+                        help="with --no-tui, also list the audio and subtitle tracks of each episode (needs mediainfo)")
     parser.add_argument("--refresh", action="store_true", help="ignore cached AniList results and the watched list")
     parser.add_argument("--include-missing", action="store_true",
                         help="also show shows on your AniList list that you have no files for (toggle with d)")
@@ -1306,11 +1599,27 @@ def main() -> int:
         print(f"  Add them to {args.aliases} as {{\"name\": \"AniList title\"}} or {{\"name\": <AniList ID>}}.")
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.no_tui
+    tracks = TrackStore(cache, use_cache)
     if not to_watch:
         print("\nNothing matched.")
     elif interactive:
         session, login_note = load_session()
-        run_tui(to_watch, statuses, session, login_note, include_missing=args.include_missing)
+        if not tracks.available:
+            login_note = (login_note + " | " if login_note else "") + "mediainfo not installed: no audio/subs columns"
+        # Tracks are read in the background for the rows the list shows, as they come on screen.
+        def fetch_titles(media_id: int) -> dict[int, str]:
+            try:
+                return fetch_episode_titles(media_id, cache, use_cache, max_age)
+            except AniListError:
+                return {}  # shown without titles; nothing is cached, so the next open tries again
+
+        try:
+            run_tui(to_watch, statuses, session, login_note, include_missing=args.include_missing,
+                    track_store=tracks, save=save, fetch_titles=fetch_titles)
+        finally:
+            tracks.poll()
+            tracks.shutdown()
+            save()
     elif not shown_default:
         print("\nNothing to show by default. Run in a terminal and press l to pick other statuses.")
     else:
@@ -1319,6 +1628,11 @@ def main() -> int:
         print_table(shown, statuses)
         if args.limit and len(shown_default) > args.limit:
             print(f"  ... {len(shown_default) - args.limit} more (use without --limit to see all)")
+        if args.tracks:
+            print_tracks(tracks, shown)
+            tracks.poll()
+            tracks.shutdown()
+            save()
     return 0
 
 

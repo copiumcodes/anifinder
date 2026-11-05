@@ -16,6 +16,7 @@ I put also no efford into this, it's just a script I find practical.
 - Linux or macOS for the interactive list (it uses `curses`).
 - Optional: `mpv` or `vlc` for playback, and `xdg-open` to open folders.
   Set `ANIFINDER_PLAYER` to use a different player.
+- Optional: `mediainfo`, to list the audio and subtitle tracks of each episode.
 
 ## Quick start
 
@@ -53,6 +54,7 @@ Anime/
 | `-u`, `--user` | AniList username (or set `ANILIST_USER`) |
 | `--no-tui` | Print a plain table instead of the interactive list |
 | `-n`, `--limit N` | With `--no-tui`, show only the first N entries |
+| `--tracks` | With `--no-tui`, list the audio and subtitle tracks of each episode (needs `mediainfo`) |
 | `--include-missing` | Start with entries you have no files for included |
 | `--refresh` | Ignore the cache and fetch everything again |
 | `--cache-days N` | How long AniList search results are reused (default 7) |
@@ -79,6 +81,12 @@ Anime/
 
 In the details view, `j`/`k` select an episode file, `Enter` plays it, and
 `o` opens the series folder. Any other key goes back.
+
+The file list in the details view is a table with the episode, title, audio
+languages, subtitle languages and file name. Audio and subtitles are read with
+`mediainfo`; without it those columns show `-`. Episode titles come from AniList
+(the titles of its streaming episodes, cached like the other AniList data). Episodes
+AniList has no title for are left blank.
 
 ## Logging in (progress and scores)
 
@@ -121,6 +129,10 @@ season (`S2`) applies to that season only. A key without one applies to every se
 AniList results are cached in `~/.cache/anifinder/search.json`. Search results
 are reused for 7 days, and your list for one hour. Several searches are sent in
 one request. Use `--refresh` to skip the cache for one run.
+
+Audio and subtitle tracks are read with `mediainfo` in the background when the
+list opens, and the results are cached too. A file is read again only when its
+size or modification time changes.
 
 ## Limitations
 
