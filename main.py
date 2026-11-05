@@ -25,18 +25,24 @@ In details: j/k pick a file, Enter plays it, o opens the folder, any other key g
 Playback uses mpv, then vlc, then xdg-open, whichever is installed. Set
 ANIFINDER_PLAYER to use another program (its arguments are allowed).
 
+Progress: with a login, playing episode N sets your AniList progress to N (never
+lower than it already is) and asks for a score. Log in with --login. The token
+is read from ANILIST_TOKEN if set, otherwise from ~/.config/anifinder/token.
+Progress is saved when the episode starts playing, not when it finishes.
+
 Caching: AniList results are cached (default 7 days, see --cache-days) and the
 watched list for an hour, so repeated runs make few requests. Several searches
 are sent in one request. Use --refresh to ignore the cache.
 
-Only the standard library is used. The AniList profile list must be public
-(AniList's GraphQL API does not return private lists without an auth token).
+Only the standard library is used. Without a login, the AniList profile list must
+be public, since AniList only returns a private list to the account that owns it.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import getpass
 import json
 import os
 import random
@@ -86,8 +92,10 @@ SEASON_RE = re.compile(
 # Common English words that get glued onto the end of a word in filenames ("Behindthe")
 GLUED_WORDS = ["the", "with", "from", "into", "and", "for"]
 
+CONFIG_DIR = Path.home() / ".config" / "anifinder"
 DEFAULT_CACHE = Path.home() / ".cache" / "anifinder" / "search.json"
-DEFAULT_ALIASES = Path.home() / ".config" / "anifinder" / "aliases.json"
+DEFAULT_ALIASES = CONFIG_DIR / "aliases.json"
+DEFAULT_TOKEN_FILE = CONFIG_DIR / "token"
 
 
 # ---------------------------------------------------------------- names
@@ -307,13 +315,15 @@ class AniListError(RuntimeError):
     pass
 
 
-def graphql(query: str, variables: dict[str, Any], retries: int = 4) -> dict[str, Any]:
+def graphql(query: str, variables: dict[str, Any], retries: int = 4, token: str | None = None) -> dict[str, Any]:
     body = json.dumps({"query": query, "variables": variables}).encode()
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     for attempt in range(retries):
         req = urllib.request.Request(ANILIST_URL, data=body, headers=headers, method="POST")
         try:
@@ -325,6 +335,8 @@ def graphql(query: str, variables: dict[str, Any], retries: int = 4) -> dict[str
                 print(f"  rate limited by AniList, waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
+            if e.code == 401:
+                raise AniListError("AniList rejected the token (expired or wrong). Run --login again.")
             if e.code == 404:
                 raise AniListError("AniList user not found")
             raise AniListError(f"AniList HTTP error {e.code}") from e
@@ -366,6 +378,40 @@ query ($name: String) {
   }
 }
 """
+
+VIEWER_QUERY = """
+query {
+  Viewer { id name mediaListOptions { scoreFormat } }
+}
+"""
+
+# Your own list entry for one anime (needs a token).
+ENTRY_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    episodes
+    mediaListEntry { status progress score }
+  }
+}
+"""
+
+SAVE_ENTRY_MUTATION = """
+mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus, $score: Float) {
+  SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status, score: $score) {
+    id progress status score
+  }
+}
+"""
+
+# How to read and check a score for each of AniList's score formats.
+SCORE_FORMATS: dict[str, tuple[str, float, float, bool]] = {
+    # format: (hint, min, max, whole numbers only)
+    "POINT_100": ("0-100", 0, 100, True),
+    "POINT_10_DECIMAL": ("0-10, decimals allowed", 0, 10, False),
+    "POINT_10": ("0-10", 0, 10, True),
+    "POINT_5": ("0-5 stars", 0, 5, True),
+    "POINT_3": ("1-3 (1 sad, 2 ok, 3 happy), 0 clears", 0, 3, True),
+}
 
 
 def build_batch_search(n: int) -> str:
@@ -456,6 +502,109 @@ def query_variants(name: str) -> list[str]:
 def is_strong_hit(query: str, results: list[dict[str, Any]]) -> bool:
     """True when one of the results is clearly the title that was searched for."""
     return any(similarity(query, t) >= 0.9 for m in results for t in titles_of(m))
+
+
+# ---------------------------------------------------------------- login and progress
+
+def token_source() -> tuple[str | None, str]:
+    """(token, where it came from). The environment variable wins over the saved file."""
+    env = os.environ.get("ANILIST_TOKEN", "").strip()
+    if env:
+        return env, "ANILIST_TOKEN"
+    try:
+        saved = DEFAULT_TOKEN_FILE.read_text().strip()
+        if saved:
+            return saved, str(DEFAULT_TOKEN_FILE)
+    except OSError:
+        pass
+    return None, ""
+
+
+def save_token(token: str) -> None:
+    DEFAULT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(DEFAULT_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    os.chmod(DEFAULT_TOKEN_FILE, 0o600)
+
+
+@dataclass
+class Session:
+    """A logged-in AniList account."""
+    token: str
+    name: str
+    score_format: str  # e.g. POINT_10, as set in the account's settings
+
+    def get_entry(self, media_id: int) -> tuple[dict[str, Any] | None, int | None]:
+        """(your list entry or None, total episodes)."""
+        data = graphql(ENTRY_QUERY, {"id": media_id}, token=self.token)["Media"]
+        return data.get("mediaListEntry"), data.get("episodes")
+
+    def save_entry(self, media_id: int, **fields: Any) -> dict[str, Any]:
+        """Create or update your list entry. Only the given fields are changed."""
+        variables = {"mediaId": media_id, **{k: v for k, v in fields.items() if v is not None}}
+        return graphql(SAVE_ENTRY_MUTATION, variables, token=self.token)["SaveMediaListEntry"]
+
+    def set_progress(self, media: dict[str, Any], episode: int) -> str:
+        """Move your progress up to the episode you just started. Never moves it back."""
+        entry, total = self.get_entry(media["id"])
+        total = total or media.get("episodes")
+        current = (entry or {}).get("progress") or 0
+        if episode <= current:
+            return f"progress stays at {current}"
+        if total and episode >= total:
+            status = "COMPLETED"
+        elif entry and entry.get("status") in ("REPEATING", "PAUSED", "DROPPED"):
+            status = entry["status"]
+        else:
+            status = "CURRENT"
+        self.save_entry(media["id"], progress=episode, status=status)
+        return f"progress {current} -> {episode}"
+
+    def set_score(self, media_id: int, score: float) -> None:
+        self.save_entry(media_id, score=score)
+
+
+def load_session() -> tuple[Session | None, str]:
+    """Log in with the stored token. Returns (session or None, message for the user)."""
+    token, source = token_source()
+    if not token:
+        return None, "not logged in: progress will not be saved (run --login)"
+    try:
+        viewer = graphql(VIEWER_QUERY, {}, token=token)["Viewer"]
+    except AniListError as e:
+        return None, f"login failed: {e}"
+    fmt = (viewer.get("mediaListOptions") or {}).get("scoreFormat") or "POINT_10"
+    return Session(token, viewer["name"], fmt), f"logged in as {viewer['name']} (token from {source})"
+
+
+def login() -> int:
+    print("To log in you need an AniList access token:")
+    print("  1. Create an API client at https://anilist.co/settings/developer")
+    print("     with the redirect URL https://anilist.co/api/v2/oauth/pin")
+    print("  2. Open https://anilist.co/api/v2/oauth/authorize?client_id=YOUR_CLIENT_ID&response_type=token")
+    print("     approve it, and copy the access token AniList shows you.")
+    token = getpass.getpass("Access token (input is hidden): ").strip()
+    if not token:
+        print("No token entered.", file=sys.stderr)
+        return 1
+    try:
+        viewer = graphql(VIEWER_QUERY, {}, token=token)["Viewer"]
+    except AniListError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    save_token(token)
+    print(f"Logged in as {viewer['name']}. Token saved to {DEFAULT_TOKEN_FILE} (readable by you only).")
+    return 0
+
+
+def logout() -> int:
+    try:
+        DEFAULT_TOKEN_FILE.unlink()
+        print(f"Removed {DEFAULT_TOKEN_FILE}.")
+    except FileNotFoundError:
+        print("No saved token.")
+    return 0
 
 
 # ---------------------------------------------------------------- cache
@@ -672,14 +821,14 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
 
 # ---------------------------------------------------------------- TUI
 
-def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
+def run_tui(rows: list[tuple[Series, dict[str, Any]]], session: Session | None, login_note: str = "") -> None:
     import curses  # imported here so the rest of the tool does not need a terminal
 
     def app(stdscr: "curses.window") -> None:
         curses.curs_set(0)
         state = ViewState()
         cursor = top = 0
-        message = ""
+        message = login_note
 
         def put(y: int, x: int, text: str, attr: int = 0) -> None:
             h, w = stdscr.getmaxyx()
@@ -688,6 +837,24 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                     stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
                 except curses.error:
                     pass
+
+        def ask_text(prompt: str) -> str | None:
+            """Read one line at the bottom of the screen. Returns None if cancelled with Esc."""
+            buf = ""
+            while True:
+                h, _ = stdscr.getmaxyx()
+                put(h - 1, 0, " " * (stdscr.getmaxyx()[1] - 1))
+                put(h - 1, 0, f"{prompt}{buf}")
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == 27:
+                    return None
+                if key in (10, 13, curses.KEY_ENTER):
+                    return buf
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    buf = buf[:-1]
+                elif 32 <= key < 127:
+                    buf += chr(key)
 
         def checklist(title: Callable[[], str], items: list[tuple[str, str]], selected: set[str],
                       single: bool = False, extra: dict[int, Callable[[], None]] | None = None) -> set[str] | None:
@@ -771,35 +938,88 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
             if result:
                 state.reset_sort(next(iter(result)))
 
+        def ask_score(current: Any, fmt: str) -> float | None:
+            """Ask for a score in the account's format. Returns None to keep the current score."""
+            hint, lo, hi, whole = SCORE_FORMATS.get(fmt, SCORE_FORMATS["POINT_10"])
+            cur_text = f"{current:g}" if current else "none"
+            prompt = f"Score ({hint}), now {cur_text}, enter keeps it: "
+            while True:
+                text = ask_text(prompt)
+                if not text:  # Esc or empty: keep the current score
+                    return None
+                try:
+                    value = float(text)
+                except ValueError:
+                    prompt = f"Not a number. Score ({hint}): "
+                    continue
+                if not (lo <= value <= hi) or (whole and value != int(value)):
+                    prompt = f"Out of range ({hint}): "
+                    continue
+                return value
+
+        def play_and_track(media: dict[str, Any], f: EpisodeFile, entry_info: list[str]) -> str:
+            """Play an episode, then update progress on AniList and ask for a score."""
+            note = play_file(f.path)
+            if f.episode is None or session is None:
+                if session is None and f.episode is not None:
+                    note += " | not logged in: progress not saved"
+                return note
+            try:
+                note += " | " + session.set_progress(media, f.episode)
+                entry, _ = session.get_entry(media["id"])
+                current = (entry or {}).get("score")
+                score = ask_score(current, session.score_format)
+                if score is not None:
+                    session.set_score(media["id"], score)
+                    note += f" | score {score:g} saved"
+                entry_info[0] = describe_entry(media, session)
+            except AniListError as e:
+                note += f" | AniList: {e}"
+            return note
+
+        def describe_entry(media: dict[str, Any], sess: Session | None) -> str:
+            if sess is None:
+                return "not logged in (run --login)"
+            try:
+                entry, total = sess.get_entry(media["id"])
+            except AniListError as e:
+                return f"unavailable: {e}"
+            if not entry:
+                return f"not on your list (episodes on AniList: {total or '?'})"
+            return (f"{entry.get('status') or '-'}, progress {entry.get('progress') or 0}"
+                    f"/{total or '?'}, score {entry.get('score') or '-'}")
+
         def details(media: dict[str, Any], s: Series) -> None:
             t = media["title"]
             total = media.get("episodes")
             have_text, missing_text = episode_coverage(s, total)
-            info = [
-                ("AniList", display_name(media)),
-                ("Romaji", t.get("romaji") or "-"),
-                ("Native", t.get("native") or "-"),
-                ("Local name", s.label),
-                ("Local files", str(s.files)),
-                ("Folder", ", ".join(sorted(s.labels)) or "-"),
-                ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
-                ("Format", media.get("format") or "-"),
-                ("Episodes", f"{total or '?'} on AniList"),
-                ("Have", have_text),
-                ("Missing", missing_text),
-                ("Score", str(media.get("averageScore") or "-")),
-                ("Year", str(media_year(media) or "-")),
-                ("Genres", ", ".join(media.get("genres") or []) or "-"),
-            ]
-            tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
-                          key=lambda t: -(t.get("rank") or 0))
-            info.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
-            info.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
-
+            entry_info = [describe_entry(media, session)]
             file_cursor = 0
             file_top = 0
             note = ""
             while True:
+                info = [
+                    ("AniList", display_name(media)),
+                    ("Romaji", t.get("romaji") or "-"),
+                    ("Native", t.get("native") or "-"),
+                    ("Local name", s.label),
+                    ("Local files", str(s.files)),
+                    ("Folder", ", ".join(sorted(s.labels)) or "-"),
+                    ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
+                    ("Format", media.get("format") or "-"),
+                    ("Episodes", f"{total or '?'} on AniList"),
+                    ("Have", have_text),
+                    ("Missing", missing_text),
+                    ("Your list", entry_info[0]),
+                    ("Score", str(media.get("averageScore") or "-")),
+                    ("Year", str(media_year(media) or "-")),
+                    ("Genres", ", ".join(media.get("genres") or []) or "-"),
+                ]
+                tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
+                              key=lambda t: -(t.get("rank") or 0))
+                info.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
+                info.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
+
                 stdscr.erase()
                 h, w = stdscr.getmaxyx()
                 put(0, 0, "Details", curses.A_BOLD)
@@ -807,7 +1027,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                     put(2 + i, 2, f"{k}:", curses.A_BOLD)
                     put(2 + i, 16, v)
                 list_top = 2 + len(info) + 1
-                put(list_top, 2, "Files (enter plays the selected file):", curses.A_BOLD)
+                put(list_top, 2, "Files (enter plays the selected file and updates your progress):", curses.A_BOLD)
                 first_row = list_top + 1
                 visible = max(1, h - 2 - first_row)
                 if file_cursor < file_top:
@@ -831,7 +1051,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                 elif key in (curses.KEY_UP, ord("k")):
                     file_cursor = max(file_cursor - 1, 0)
                 elif key in (10, 13, curses.KEY_ENTER) and s.episode_files:
-                    note = play_file(s.episode_files[file_cursor].path)
+                    note = play_and_track(media, s.episode_files[file_cursor], entry_info)
                 elif key == ord("o"):
                     note = open_folder(s)
                 else:
@@ -928,7 +1148,7 @@ def load_aliases(path: Path) -> dict[str, str | int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("directory", type=Path, help="directory containing your downloaded anime")
+    parser.add_argument("directory", type=Path, nargs="?", help="directory containing your downloaded anime")
     parser.add_argument("-u", "--user", default=os.environ.get("ANILIST_USER"),
                         help="your AniList username (or set ANILIST_USER)")
     parser.add_argument("-n", "--limit", type=int, default=0,
@@ -940,8 +1160,16 @@ def main() -> int:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache file")
     parser.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES,
                         help="JSON file mapping local names to AniList titles or IDs")
+    parser.add_argument("--login", action="store_true", help="save an AniList access token to track progress")
+    parser.add_argument("--logout", action="store_true", help="delete the saved AniList access token")
     args = parser.parse_args()
 
+    if args.login:
+        return login()
+    if args.logout:
+        return logout()
+    if not args.directory:
+        parser.error("a directory is required")
     if not args.user:
         parser.error("an AniList username is required (--user or ANILIST_USER)")
     if not args.directory.is_dir():
@@ -1017,7 +1245,8 @@ def main() -> int:
     if not to_watch:
         print("\nNothing left to watch.")
     elif interactive:
-        run_tui(to_watch)
+        session, login_note = load_session()
+        run_tui(to_watch, session, login_note)
     else:
         shown = to_watch[: args.limit] if args.limit else to_watch
         print(f"\nNot watched yet ({len(to_watch)}), best rated first:")
