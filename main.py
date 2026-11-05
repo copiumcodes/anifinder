@@ -3,8 +3,8 @@
 
 Scans a directory for video files, works out the series and season of each
 one from its name, looks it up on AniList, and removes everything that appears
-in your AniList list with a watched status. What is left is what you can pick
-from.
+in your AniList list with a watched status. What is left is shown in an
+interactive list where you can filter by format or tag and change the sort.
 
 Understands folders sorted by season ("2024-winter", "2023-fall", "2022-movies",
 including misspellings such as "2026-sping"). Files directly inside those
@@ -16,6 +16,9 @@ If a name still cannot be matched, add it to the aliases file
 or {"local name": 12345} with an AniList media ID. For one season of a show,
 use the season in the key, e.g. {"Aharen Is Indecipherable S2": 179979}; a key
 without a season applies to every season.
+
+Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
+c clear filters, Enter details, q quit.
 
 Only the standard library is used. The AniList profile list must be public
 (AniList's GraphQL API does not return private lists without an auth token).
@@ -32,9 +35,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ANILIST_URL = "https://graphql.anilist.co"
 USER_AGENT = "anifinder/0.1"
@@ -49,7 +53,10 @@ SEASON_MISMATCH_PENALTY = 0.15
 SEASON_ONE_BONUS = 0.02  # when the name has no season, prefer season 1 among similar entries
 MAX_QUERIES = 6          # AniList searches per series
 REQUEST_DELAY = 0.8      # AniList allows ~90 requests/minute
-CACHE_VERSION = "v3"     # bump when the fields requested from AniList change
+CACHE_VERSION = "v4"     # bump when the fields requested from AniList change
+TAG_MIN_RANK = 60        # ignore AniList tags ranked below this (they are often noise)
+
+FORMAT_ORDER = ["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC"]
 
 SEASON_WORDS = ["winter", "spring", "summer", "fall", "autumn", "movies", "movie", "films", "film"]
 SEASON_FOLDER_RE = re.compile(r"^(?P<year>\d{4})[\s._-]*(?P<word>[A-Za-z]+)$")
@@ -225,6 +232,8 @@ MEDIA_FIELDS = """
   format
   seasonYear
   startDate { year }
+  genres
+  tags { name rank }
 """
 
 SEARCH_QUERY = f"""
@@ -372,12 +381,77 @@ def load_aliases(path: Path) -> dict[str, str | int]:
     return {norm_key(k): v for k, v in data.items() if isinstance(v, (str, int))}
 
 
-# ---------------------------------------------------------------- output
+# ---------------------------------------------------------------- filtering and sorting
 
 def display_name(media: dict[str, Any]) -> str:
     t = media["title"]
     return t.get("english") or t.get("romaji") or t.get("native") or "?"
 
+
+def row_tags(media: dict[str, Any]) -> set[str]:
+    """Genres plus tags ranked high enough to be meaningful."""
+    tags = {t["name"] for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK}
+    return tags | set(media.get("genres") or [])
+
+
+SORT_OPTIONS: dict[str, tuple[str, Callable[[tuple[Series, dict[str, Any]]], Any], bool]] = {
+    # key: (label, sort key function, default descending)
+    "score":    ("Score",       lambda r: r[1].get("averageScore") or 0, True),
+    "title":    ("AniList name", lambda r: display_name(r[1]).lower(), False),
+    "local":    ("Local name",  lambda r: r[0].label.lower(), False),
+    "year":     ("Year",        lambda r: media_year(r[1]) or 0, True),
+    "episodes": ("Episodes",    lambda r: r[1].get("episodes") or float("inf"), False),  # unknown last
+    "files":    ("Local files", lambda r: r[0].files, True),
+    "format":   ("Format",      lambda r: r[1].get("format") or "", False),
+}
+
+
+@dataclass
+class ViewState:
+    formats: set[str] = field(default_factory=set)   # empty = all formats
+    tags: set[str] = field(default_factory=set)      # empty = all tags
+    tag_mode: str = "any"                            # "any": match one selected tag, "all": match every one
+    sort_key: str = "score"
+    desc: bool = True
+
+    def reset_sort(self, key: str) -> None:
+        self.sort_key = key
+        self.desc = SORT_OPTIONS[key][2]
+
+    def clear_filters(self) -> None:
+        self.formats.clear()
+        self.tags.clear()
+        self.tag_mode = "any"
+
+
+def apply_view(rows: list[tuple[Series, dict[str, Any]]], state: ViewState) -> list[tuple[Series, dict[str, Any]]]:
+    out = []
+    for s, media in rows:
+        if state.formats and (media.get("format") or "") not in state.formats:
+            continue
+        if state.tags:
+            tags = row_tags(media)
+            ok = state.tags <= tags if state.tag_mode == "all" else bool(state.tags & tags)
+            if not ok:
+                continue
+        out.append((s, media))
+    _, keyfn, _ = SORT_OPTIONS[state.sort_key]
+    # sorted() is stable, so ties keep the order they were in before.
+    return sorted(out, key=keyfn, reverse=state.desc)
+
+
+def available_formats(rows: list[tuple[Series, dict[str, Any]]]) -> list[tuple[str, int]]:
+    counts = Counter(m.get("format") or "?" for _, m in rows)
+    order = {f: i for i, f in enumerate(FORMAT_ORDER)}
+    return sorted(counts.items(), key=lambda kv: (order.get(kv[0], len(order)), kv[0]))
+
+
+def available_tags(rows: list[tuple[Series, dict[str, Any]]], limit: int = 80) -> list[tuple[str, int]]:
+    counts = Counter(t for _, m in rows for t in row_tags(m))
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+
+# ---------------------------------------------------------------- output
 
 def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
     if not rows:
@@ -400,6 +474,204 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
         )
 
 
+# ---------------------------------------------------------------- TUI
+
+def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
+    import curses  # imported here so the rest of the tool does not need a terminal
+
+    def app(stdscr: "curses.window") -> None:
+        curses.curs_set(0)
+        state = ViewState()
+        cursor = top = 0
+        message = ""
+
+        def put(y: int, x: int, text: str, attr: int = 0) -> None:
+            h, w = stdscr.getmaxyx()
+            if 0 <= y < h and x < w:
+                try:
+                    stdscr.addnstr(y, x, text, max(0, w - x - 1), attr)
+                except curses.error:
+                    pass
+
+        def checklist(title: Callable[[], str], items: list[tuple[str, str]], selected: set[str],
+                      single: bool = False, extra: dict[int, Callable[[], None]] | None = None) -> set[str] | None:
+            """Pick from a list. Returns the new selection, or None if cancelled."""
+            sel = set(selected)
+            idx = 0
+            off = 0
+            extra = extra or {}
+            while True:
+                stdscr.erase()
+                h, _ = stdscr.getmaxyx()
+                put(0, 0, title(), curses.A_BOLD)
+                if not items:
+                    put(2, 2, "Nothing to choose from. Press any key.")
+                    stdscr.refresh()
+                    stdscr.getch()
+                    return None
+                body = h - 3
+                if idx < off:
+                    off = idx
+                if idx >= off + body:
+                    off = idx - body + 1
+                for row, (value, label) in enumerate(items[off: off + body]):
+                    mark = "(*)" if value in sel and single else "[x]" if value in sel else "[ ]"
+                    attr = curses.A_REVERSE if off + row == idx else 0
+                    put(2 + row, 2, f"{mark} {label}", attr)
+                put(h - 1, 0, "space toggle  enter apply  esc cancel" + ("  |  " + "  ".join(
+                    f"{chr(k)} {fn.__name__}" for k, fn in extra.items()) if extra else ""))
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == 27:
+                    return None
+                if key in (10, 13, curses.KEY_ENTER):
+                    return {items[idx][0]} if single else sel
+                if key == ord(" "):
+                    value = items[idx][0]
+                    if single:
+                        sel = {value}
+                    elif value in sel:
+                        sel.discard(value)
+                    else:
+                        sel.add(value)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    idx = min(idx + 1, len(items) - 1)
+                elif key in (curses.KEY_UP, ord("k")):
+                    idx = max(idx - 1, 0)
+                elif key == curses.KEY_NPAGE:
+                    idx = min(idx + body, len(items) - 1)
+                elif key == curses.KEY_PPAGE:
+                    idx = max(idx - body, 0)
+                elif key in extra:
+                    extra[key]()
+
+        def pick_formats() -> None:
+            choices = available_formats(rows)
+            items = [(f, f"{f} ({n})") for f, n in choices]
+            result = checklist(lambda: "Filter by format (space to toggle, enter to apply)",
+                               items, state.formats)
+            if result is not None:
+                state.formats = result
+
+        def pick_tags() -> None:
+            choices = available_tags(rows)
+            items = [(t, f"{t} ({n})") for t, n in choices]
+
+            def toggle_mode() -> None:
+                state.tag_mode = "all" if state.tag_mode == "any" else "any"
+
+            toggle_mode.__name__ = "mode"
+            result = checklist(
+                lambda: f"Filter by tag/genre, mode: {state.tag_mode} "
+                        f"({'match any selected' if state.tag_mode == 'any' else 'match all selected'})",
+                items, state.tags, extra={ord("m"): toggle_mode},
+            )
+            if result is not None:
+                state.tags = result
+
+        def pick_sort() -> None:
+            items = [(k, label) for k, (label, _, _) in SORT_OPTIONS.items()]
+            result = checklist(lambda: "Sort by (enter to choose)", items, {state.sort_key}, single=True)
+            if result:
+                state.reset_sort(next(iter(result)))
+
+        def details(media: dict[str, Any], s: Series) -> None:
+            stdscr.erase()
+            t = media["title"]
+            lines = [
+                ("AniList", display_name(media)),
+                ("Romaji", t.get("romaji") or "-"),
+                ("Native", t.get("native") or "-"),
+                ("Local name", s.label),
+                ("Local files", str(s.files)),
+                ("Folder", ", ".join(sorted(s.labels)) or "-"),
+                ("Format", media.get("format") or "-"),
+                ("Episodes", str(media.get("episodes") or "?")),
+                ("Score", str(media.get("averageScore") or "-")),
+                ("Year", str(media_year(media) or "-")),
+                ("Genres", ", ".join(media.get("genres") or []) or "-"),
+            ]
+            tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
+                          key=lambda t: -(t.get("rank") or 0))
+            lines.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
+            lines.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
+            put(0, 0, "Details (press any key to go back)", curses.A_BOLD)
+            for i, (k, v) in enumerate(lines):
+                put(2 + i * 2, 2, f"{k}:", curses.A_BOLD)
+                put(2 + i * 2, 16, v)
+            stdscr.refresh()
+            stdscr.getch()
+
+        while True:
+            view = apply_view(rows, state)
+            h, w = stdscr.getmaxyx()
+            body = max(1, h - 4)
+            cursor = min(cursor, max(0, len(view) - 1))
+            if cursor < top:
+                top = cursor
+            if cursor >= top + body:
+                top = cursor - body + 1
+
+            stdscr.erase()
+            fmt_f = ",".join(sorted(state.formats)) or "all"
+            tag_f = (f"{','.join(sorted(state.tags))} ({state.tag_mode})" if state.tags else "all")
+            label = SORT_OPTIONS[state.sort_key][0]
+            put(0, 0, f"anifinder: {len(view)} of {len(rows)} not watched", curses.A_BOLD)
+            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | sort: {label} {'desc' if state.desc else 'asc'}")
+
+            aw = max(8, w - 66)
+            put(2, 0, f"{'#':>4}  {'Local name':<28}  {'AniList name':<{aw}}  {'Scr':>3}  {'Eps':>3}  {'Year':>4}  Format",
+                curses.A_UNDERLINE)
+            if not view:
+                put(4, 2, "No entries match the current filters. Press c to clear them.")
+            for i, (s, media) in enumerate(view[top: top + body]):
+                pos = top + i
+                score = media.get("averageScore") or "-"
+                eps = media.get("episodes") or "?"
+                year = media_year(media) or "-"
+                line = (f"{pos + 1:>4}  {s.label[:28]:<28}  {display_name(media)[:aw]:<{aw}}  "
+                        f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {media.get('format') or '-'}")
+                put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
+            put(h - 2, 0, message)
+            put(h - 1, 0, "j/k move  f formats  t tags  s sort  r reverse  c clear  enter details  q quit")
+            stdscr.refresh()
+            message = ""
+
+            key = stdscr.getch()
+            if key in (ord("q"), 27):
+                return
+            if key in (curses.KEY_DOWN, ord("j")):
+                cursor = min(cursor + 1, max(0, len(view) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                cursor = max(cursor - 1, 0)
+            elif key == curses.KEY_NPAGE:
+                cursor = min(cursor + body, max(0, len(view) - 1))
+            elif key == curses.KEY_PPAGE:
+                cursor = max(cursor - body, 0)
+            elif key in (ord("g"), curses.KEY_HOME):
+                cursor = 0
+            elif key in (ord("G"), curses.KEY_END):
+                cursor = max(0, len(view) - 1)
+            elif key == ord("f"):
+                pick_formats()
+                cursor = 0
+            elif key == ord("t"):
+                pick_tags()
+                cursor = 0
+            elif key == ord("s"):
+                pick_sort()
+            elif key == ord("r"):
+                state.desc = not state.desc
+            elif key == ord("c"):
+                state.clear_filters()
+                cursor = 0
+            elif key in (10, 13, curses.KEY_ENTER) and view:
+                s, media = view[cursor]
+                details(media, s)
+
+    curses.wrapper(app)
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -408,7 +680,8 @@ def main() -> int:
     parser.add_argument("-u", "--user", default=os.environ.get("ANILIST_USER"),
                         help="your AniList username (or set ANILIST_USER)")
     parser.add_argument("-n", "--limit", type=int, default=0,
-                        help="only show the top N suggestions (default: all)")
+                        help="without the TUI, only print the top N suggestions (default: all)")
+    parser.add_argument("--no-tui", action="store_true", help="print a plain table instead of the interactive list")
     parser.add_argument("--refresh", action="store_true", help="ignore cached AniList search results")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="search cache file")
     parser.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES,
@@ -467,18 +740,8 @@ def main() -> int:
     print()
     save_cache(args.cache, cache)
 
-    def sort_key(row):
-        s, media = row
-        return (-(media.get("averageScore") or 0), s.name.lower(), s.season or 0)
-
-    to_watch.sort(key=sort_key)
-    already.sort(key=sort_key)
-
-    shown = to_watch[: args.limit] if args.limit else to_watch
-    print(f"\nNot watched yet ({len(to_watch)}), best rated first:")
-    print_table(shown)
-    if args.limit and len(to_watch) > args.limit:
-        print(f"  ... {len(to_watch) - args.limit} more (use without --limit to see all)")
+    to_watch.sort(key=lambda r: (-(r[1].get("averageScore") or 0), r[0].label.lower()))
+    already.sort(key=lambda r: r[0].label.lower())
 
     print(f"\nAlready watched, skipped ({len(already)}):")
     print("  " + ", ".join(f"{s.label} = {display_name(m)}" for s, m in already) if already else "  (none)")
@@ -487,6 +750,18 @@ def main() -> int:
     print("  " + ", ".join(s.label for s in unmatched) if unmatched else "  (none)")
     if unmatched:
         print(f"  Add them to {args.aliases} as {{\"name\": \"AniList title\"}} or {{\"name\": <AniList ID>}}.")
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.no_tui
+    if not to_watch:
+        print("\nNothing left to watch.")
+    elif interactive:
+        run_tui(to_watch)
+    else:
+        shown = to_watch[: args.limit] if args.limit else to_watch
+        print(f"\nNot watched yet ({len(to_watch)}), best rated first:")
+        print_table(shown)
+        if args.limit and len(to_watch) > args.limit:
+            print(f"  ... {len(to_watch) - args.limit} more (use without --limit to see all)")
     return 0
 
 
