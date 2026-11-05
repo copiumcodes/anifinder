@@ -5,6 +5,11 @@ files, matches them to [AniList](https://anilist.co), and shows what is left in
 an interactive list. You can filter and sort the list, see which episodes you
 have, play episodes, and update your AniList progress and score.
 
+## Disclaimer
+
+This script is mostly ['vibe coded'](http://vibe-coding.urbanup.com/18443768), look at the Folder layout section to see a good example of that.
+I put also no efford into this, it's just a script I find practical.
+
 ## Requirements
 
 - Python 3 (tested with 3.14). Only the standard library is used.
