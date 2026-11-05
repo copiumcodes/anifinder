@@ -18,7 +18,7 @@ use the season in the key, e.g. {"Aharen Is Indecipherable S2": 179979}; a key
 without a season applies to every season.
 
 Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
-c clear filters, Enter details, q quit.
+c clear filters, x random pick, Enter details (o in details opens the folder), q quit.
 
 Only the standard library is used. The AniList profile list must be public
 (AniList's GraphQL API does not return private lists without an auth token).
@@ -30,7 +30,10 @@ import argparse
 import difflib
 import json
 import os
+import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -140,16 +143,38 @@ def season_folder_year(part: str) -> int | None:
     return None
 
 
-def classify(rel_parts: tuple[str, ...]) -> tuple[str | None, int | None, str]:
-    """Return (season folder, season year, raw series name) for a file path relative to the root."""
+def classify(rel_parts: tuple[str, ...]) -> tuple[str | None, int | None, str, int]:
+    """Return (season folder, season year, raw series name, series folder depth) for a file path
+    relative to the root. The depth is how many leading parts form the series folder; 0 means the
+    file's own folder."""
     dirs, filename = rel_parts[:-1], rel_parts[-1]
     stem = Path(filename).stem
     for i, part in enumerate(dirs):
         year = season_folder_year(part)
         if year is not None:
-            raw = dirs[i + 1] if i + 1 < len(dirs) else stem
-            return part, year, raw
-    return None, None, dirs[0] if dirs else stem
+            if i + 1 < len(dirs):
+                return part, year, dirs[i + 1], i + 2
+            return part, year, stem, 0
+    if dirs:
+        return None, None, dirs[0], 1
+    return None, None, stem, 0
+
+
+def open_folder(s: Series) -> str:
+    """Open a series' folder in the desktop file manager. Returns a status message."""
+    if not s.folders:
+        return "no folder known for this entry"
+    folder = sorted(s.folders)[0]
+    opener = shutil.which("xdg-open")
+    if opener is None:
+        return f"xdg-open not found. Path: {folder}"
+    try:
+        subprocess.Popen([opener, str(folder)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return f"could not open {folder}: {e}"
+    extra = f" ({len(s.folders)} folders, opened the first)" if len(s.folders) > 1 else ""
+    return f"opened {folder}{extra}"
 
 
 # ---------------------------------------------------------------- scanning
@@ -161,6 +186,7 @@ class Series:
     files: int = 0
     years: set[int] = field(default_factory=set)
     labels: set[str] = field(default_factory=set)
+    folders: set[Path] = field(default_factory=set)  # where the files are on disk
     query: str = ""  # what is actually searched on AniList (may come from an alias)
 
     def __post_init__(self) -> None:
@@ -176,10 +202,12 @@ def scan_directory(root: Path) -> dict[tuple[str, int | None], Series]:
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
-        label, year, raw = classify(path.relative_to(root).parts)
+        rel = path.relative_to(root)
+        label, year, raw, depth = classify(rel.parts)
         name, season = parse_name(raw)
         entry = series.setdefault((norm_key(name), season), Series(name, season))
         entry.files += 1
+        entry.folders.add(root.joinpath(*rel.parts[:depth]) if depth else path.parent)
         if label:
             entry.labels.add(label)
         if year:
@@ -585,6 +613,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                 ("Local name", s.label),
                 ("Local files", str(s.files)),
                 ("Folder", ", ".join(sorted(s.labels)) or "-"),
+                ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
                 ("Format", media.get("format") or "-"),
                 ("Episodes", str(media.get("episodes") or "?")),
                 ("Score", str(media.get("averageScore") or "-")),
@@ -595,12 +624,20 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                           key=lambda t: -(t.get("rank") or 0))
             lines.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
             lines.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
-            put(0, 0, "Details (press any key to go back)", curses.A_BOLD)
-            for i, (k, v) in enumerate(lines):
-                put(2 + i * 2, 2, f"{k}:", curses.A_BOLD)
-                put(2 + i * 2, 16, v)
-            stdscr.refresh()
-            stdscr.getch()
+            note = ""
+            while True:
+                stdscr.erase()
+                put(0, 0, "Details", curses.A_BOLD)
+                for i, (k, v) in enumerate(lines):
+                    put(2 + i, 2, f"{k}:", curses.A_BOLD)
+                    put(2 + i, 16, v)
+                h, _ = stdscr.getmaxyx()
+                put(h - 2, 0, note)
+                put(h - 1, 0, "o open folder  |  any other key: back")
+                stdscr.refresh()
+                if stdscr.getch() != ord("o"):
+                    return
+                note = open_folder(s)
 
         while True:
             view = apply_view(rows, state)
@@ -633,7 +670,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                         f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {media.get('format') or '-'}")
                 put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
             put(h - 2, 0, message)
-            put(h - 1, 0, "j/k move  f formats  t tags  s sort  r reverse  c clear  enter details  q quit")
+            put(h - 1, 0, "j/k move  f formats  t tags  s sort  r reverse  c clear  x random  enter details  q quit")
             stdscr.refresh()
             message = ""
 
@@ -665,6 +702,9 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
             elif key == ord("c"):
                 state.clear_filters()
                 cursor = 0
+            elif key == ord("x") and view:
+                cursor = random.randrange(len(view))
+                message = f"Random pick: {display_name(view[cursor][1])}  (enter for details)"
             elif key in (10, 13, curses.KEY_ENTER) and view:
                 s, media = view[cursor]
                 details(media, s)
