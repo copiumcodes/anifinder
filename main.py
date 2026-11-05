@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """anifinder: find downloaded anime you have not watched yet, using AniList.
 
-Scans a directory for video files, works out the series and season of each
-one from its name, looks it up on AniList, and removes everything that appears
-in your AniList list with a watched status. What is left is shown in an
-interactive list where you can filter by format or tag and change the sort.
+Scans a directory for video files, works out the series, season and episode
+number of each file from its name, looks the series up on AniList, and removes
+everything that appears in your AniList list with a watched status. What is
+left is shown in an interactive list where you can filter by format or tag,
+change the sort, see which episodes you have, and play them.
 
 Understands folders sorted by season ("2024-winter", "2023-fall", "2022-movies",
 including misspellings such as "2026-sping"). Files directly inside those
@@ -18,7 +19,11 @@ use the season in the key, e.g. {"Aharen Is Indecipherable S2": 179979}; a key
 without a season applies to every season.
 
 Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
-c clear filters, x random pick, Enter details (o in details opens the folder), q quit.
+c clear filters, x random pick, Enter details, q quit.
+In details: j/k pick a file, Enter plays it, o opens the folder, any other key goes back.
+
+Playback uses mpv, then vlc, then xdg-open, whichever is installed. Set
+ANIFINDER_PLAYER to use another program (its arguments are allowed).
 
 Caching: AniList results are cached (default 7 days, see --cache-days) and the
 watched list for an hour, so repeated runs make few requests. Several searches
@@ -36,6 +41,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,6 +72,7 @@ DEFAULT_CACHE_DAYS = 7   # how long search and media results are reused
 WATCHED_MAX_AGE = 3600   # the watched list is re-fetched after an hour
 CACHE_KEEP_DAYS = 30     # entries older than this are dropped when the cache is saved
 TAG_MIN_RANK = 60        # ignore AniList tags ranked below this (they are often noise)
+PLAYERS = ["mpv", "vlc", "xdg-open"]
 
 FORMAT_ORDER = ["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA", "MUSIC"]
 
@@ -141,6 +148,32 @@ def parse_name(raw: str) -> tuple[str, int | None]:
     return (name or clean_title(raw) or raw.strip()), season
 
 
+def parse_episode(stem: str) -> int | None:
+    """Episode number from a file name (without extension), or None if there is none.
+
+    Tries the common release patterns in order of how reliable they are:
+    S01E05, E05 / EP05 / Episode 5, ' - 05', '[05]', then a bare number left over.
+    Season markers and resolutions are ignored, so 'Show S02' is not episode 2."""
+    m = re.search(r"S\d{1,2}E(\d{1,4})", stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(?:E|EP|Episode)\s*(\d{1,4})\b", stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\s[-–]\s*(\d{1,4})(?:v\d+)?(?=\s|\[|\(|\.|$)", stem)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\[(\d{1,4})(?:v\d+)?\]", stem)
+    if m:
+        return int(m.group(1))
+    # Last resort: a bare 1-3 digit number once tags, resolutions and season markers are removed.
+    cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}", " ", stem)
+    cleaned = re.sub(r"\b(480|720|1080|2160)p\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = SEASON_RE.sub(" ", cleaned)
+    numbers = re.findall(r"(?<![\w.])\d{1,3}(?![\w])", cleaned)
+    return int(numbers[-1]) if numbers else None
+
+
 def season_folder_year(part: str) -> int | None:
     """'2024-winter' -> 2024. Tolerates small typos in the season word ('2026-sping')."""
     m = SEASON_FOLDER_RE.match(part)
@@ -168,6 +201,49 @@ def classify(rel_parts: tuple[str, ...]) -> tuple[str | None, int | None, str, i
     return None, None, stem, 0
 
 
+def compress_numbers(nums: list[int]) -> str:
+    """[1, 2, 3, 5, 7, 8] -> '1-3, 5, 7-8'."""
+    parts: list[str] = []
+    for n in sorted(set(nums)):
+        if parts and "-" not in parts[-1] and int(parts[-1]) == n - 1:
+            parts[-1] = f"{parts[-1]}-{n}"
+        elif parts and "-" in parts[-1] and int(parts[-1].split("-")[1]) == n - 1:
+            parts[-1] = f"{parts[-1].split('-')[0]}-{n}"
+        else:
+            parts.append(str(n))
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------- scanning
+
+@dataclass
+class EpisodeFile:
+    path: Path
+    episode: int | None  # None when the name has no episode number (e.g. a movie)
+
+
+@dataclass
+class Series:
+    name: str
+    season: int | None = None
+    years: set[int] = field(default_factory=set)
+    labels: set[str] = field(default_factory=set)
+    folders: set[Path] = field(default_factory=set)  # where the files are on disk
+    episode_files: list[EpisodeFile] = field(default_factory=list)
+    query: str = ""  # what is actually searched on AniList (may come from an alias)
+
+    def __post_init__(self) -> None:
+        self.query = self.query or self.name
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} S{self.season}" if self.season else self.name
+
+    @property
+    def files(self) -> int:
+        return len(self.episode_files)
+
+
 def open_folder(s: Series) -> str:
     """Open a series' folder in the desktop file manager. Returns a status message."""
     if not s.folders:
@@ -185,24 +261,24 @@ def open_folder(s: Series) -> str:
     return f"opened {folder}{extra}"
 
 
-# ---------------------------------------------------------------- scanning
-
-@dataclass
-class Series:
-    name: str
-    season: int | None = None
-    files: int = 0
-    years: set[int] = field(default_factory=set)
-    labels: set[str] = field(default_factory=set)
-    folders: set[Path] = field(default_factory=set)  # where the files are on disk
-    query: str = ""  # what is actually searched on AniList (may come from an alias)
-
-    def __post_init__(self) -> None:
-        self.query = self.query or self.name
-
-    @property
-    def label(self) -> str:
-        return f"{self.name} S{self.season}" if self.season else self.name
+def play_file(path: Path) -> str:
+    """Start a video in an external player without waiting for it. Returns a status message."""
+    custom = os.environ.get("ANIFINDER_PLAYER", "").strip()
+    if custom:
+        argv = shlex.split(custom)
+        if not argv or shutil.which(argv[0]) is None:
+            return f"ANIFINDER_PLAYER not found: {custom}"
+    else:
+        exe = next((p for p in PLAYERS if shutil.which(p)), None)
+        if exe is None:
+            return "no player found: install mpv or vlc, or set ANIFINDER_PLAYER"
+        argv = [exe]
+    try:
+        subprocess.Popen([*argv, str(path)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return f"could not start {argv[0]}: {e}"
+    return f"playing {path.name} with {argv[0]}"
 
 
 def scan_directory(root: Path) -> dict[tuple[str, int | None], Series]:
@@ -214,12 +290,14 @@ def scan_directory(root: Path) -> dict[tuple[str, int | None], Series]:
         label, year, raw, depth = classify(rel.parts)
         name, season = parse_name(raw)
         entry = series.setdefault((norm_key(name), season), Series(name, season))
-        entry.files += 1
+        entry.episode_files.append(EpisodeFile(path, parse_episode(path.stem)))
         entry.folders.add(root.joinpath(*rel.parts[:depth]) if depth else path.parent)
         if label:
             entry.labels.add(label)
         if year:
             entry.years.add(year)
+    for entry in series.values():
+        entry.episode_files.sort(key=lambda f: (f.episode is None, f.episode or 0, f.path.name.lower()))
     return series
 
 
@@ -554,6 +632,21 @@ def available_tags(rows: list[tuple[Series, dict[str, Any]]], limit: int = 80) -
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
+def episode_coverage(s: Series, total: int | None) -> tuple[str, str]:
+    """(episodes you have, episodes missing) as text, using the AniList episode count when known."""
+    have = sorted({f.episode for f in s.episode_files if f.episode is not None})
+    unnumbered = sum(1 for f in s.episode_files if f.episode is None)
+    have_text = compress_numbers(have) or "none numbered"
+    if unnumbered:
+        have_text += f" (+{unnumbered} without a number)"
+    if total:
+        missing = [n for n in range(1, total + 1) if n not in have]
+        missing_text = compress_numbers(missing) or "none"
+    else:
+        missing_text = "unknown (AniList episode count not known)"
+    return have_text, missing_text
+
+
 # ---------------------------------------------------------------- output
 
 def print_table(rows: list[tuple[Series, dict[str, Any]]]) -> None:
@@ -680,7 +773,9 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
 
         def details(media: dict[str, Any], s: Series) -> None:
             t = media["title"]
-            lines = [
+            total = media.get("episodes")
+            have_text, missing_text = episode_coverage(s, total)
+            info = [
                 ("AniList", display_name(media)),
                 ("Romaji", t.get("romaji") or "-"),
                 ("Native", t.get("native") or "-"),
@@ -689,29 +784,58 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]]) -> None:
                 ("Folder", ", ".join(sorted(s.labels)) or "-"),
                 ("Path", ", ".join(str(p) for p in sorted(s.folders)) or "-"),
                 ("Format", media.get("format") or "-"),
-                ("Episodes", str(media.get("episodes") or "?")),
+                ("Episodes", f"{total or '?'} on AniList"),
+                ("Have", have_text),
+                ("Missing", missing_text),
                 ("Score", str(media.get("averageScore") or "-")),
                 ("Year", str(media_year(media) or "-")),
                 ("Genres", ", ".join(media.get("genres") or []) or "-"),
             ]
             tags = sorted((t for t in media.get("tags") or [] if (t.get("rank") or 0) >= TAG_MIN_RANK),
                           key=lambda t: -(t.get("rank") or 0))
-            lines.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
-            lines.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
+            info.append(("Tags", ", ".join(f"{t['name']} ({t['rank']})" for t in tags[:15]) or "-"))
+            info.append(("AniList", f"https://anilist.co/anime/{media['id']}"))
+
+            file_cursor = 0
+            file_top = 0
             note = ""
             while True:
                 stdscr.erase()
+                h, w = stdscr.getmaxyx()
                 put(0, 0, "Details", curses.A_BOLD)
-                for i, (k, v) in enumerate(lines):
+                for i, (k, v) in enumerate(info):
                     put(2 + i, 2, f"{k}:", curses.A_BOLD)
                     put(2 + i, 16, v)
-                h, _ = stdscr.getmaxyx()
+                list_top = 2 + len(info) + 1
+                put(list_top, 2, "Files (enter plays the selected file):", curses.A_BOLD)
+                first_row = list_top + 1
+                visible = max(1, h - 2 - first_row)
+                if file_cursor < file_top:
+                    file_top = file_cursor
+                if file_cursor >= file_top + visible:
+                    file_top = file_cursor - visible + 1
+                if not s.episode_files:
+                    put(first_row, 4, "(no files)")
+                for i, f in enumerate(s.episode_files[file_top: file_top + visible]):
+                    pos = file_top + i
+                    ep = f"E{f.episode:02d}" if f.episode is not None else "  -"
+                    attr = curses.A_REVERSE if pos == file_cursor else 0
+                    put(first_row + i, 4, f"{ep:>4}  {f.path.name}", attr)
                 put(h - 2, 0, note)
-                put(h - 1, 0, "o open folder  |  any other key: back")
+                put(h - 1, 0, "j/k select  enter play  o open folder  any other key: back")
                 stdscr.refresh()
-                if stdscr.getch() != ord("o"):
+
+                key = stdscr.getch()
+                if key in (curses.KEY_DOWN, ord("j")):
+                    file_cursor = min(file_cursor + 1, max(0, len(s.episode_files) - 1))
+                elif key in (curses.KEY_UP, ord("k")):
+                    file_cursor = max(file_cursor - 1, 0)
+                elif key in (10, 13, curses.KEY_ENTER) and s.episode_files:
+                    note = play_file(s.episode_files[file_cursor].path)
+                elif key == ord("o"):
+                    note = open_folder(s)
+                else:
                     return
-                note = open_folder(s)
 
         while True:
             view = apply_view(rows, state)
