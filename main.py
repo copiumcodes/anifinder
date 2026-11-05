@@ -20,7 +20,8 @@ use the season in the key, e.g. {"Aharen Is Indecipherable S2": 179979}; a key
 without a season applies to every season.
 
 Keys in the list: j/k or arrows move, f formats, t tags, s sort, r reverse,
-l list status, c clear filters, x random pick, Enter details, q quit.
+l list status, d also shows entries with no local files, c clear filters, x random pick,
+Enter details, q quit. --include-missing starts with that option on.
 In details: j/k pick a file, Enter plays it, o opens the folder, any other key goes back.
 
 Playback uses mpv, then vlc, then xdg-open, whichever is installed. Set
@@ -375,15 +376,15 @@ query ($id: Int) {{
 }}
 """
 
-WATCHED_QUERY = """
-query ($name: String) {
-  MediaListCollection(userName: $name, type: ANIME) {
-    lists {
+WATCHED_QUERY = f"""
+query ($name: String) {{
+  MediaListCollection(userName: $name, type: ANIME) {{
+    lists {{
       status
-      entries { status media { id } }
-    }
-  }
-}
+      entries {{ status media {{ {MEDIA_FIELDS} }} }}
+    }}
+  }}
+}}
 """
 
 VIEWER_QUERY = """
@@ -431,17 +432,18 @@ def build_batch_search(n: int) -> str:
     return f"query ({variables}) {{\n{fields}\n}}"
 
 
-def fetch_list_statuses(user: str) -> dict[int, str]:
-    """Your list status for every anime on the user's public list: {media id: status}."""
+def fetch_list_entries(user: str) -> dict[int, dict[str, Any]]:
+    """Every anime on the user's list: {media id: {"status": ..., "media": ...}}."""
     data = graphql(WATCHED_QUERY, {"name": user})
     collection = data.get("MediaListCollection") or {}
-    statuses: dict[int, str] = {}
+    entries: dict[int, dict[str, Any]] = {}
     for lst in collection.get("lists", []):
         for entry in lst.get("entries", []):
             status = entry.get("status") or lst.get("status")
-            if status:
-                statuses[entry["media"]["id"]] = status
-    return statuses
+            media = entry.get("media")
+            if status and media:
+                entries[media["id"]] = {"status": status, "media": media}
+    return entries
 
 
 def media_year(media: dict[str, Any]) -> int | None:
@@ -645,13 +647,13 @@ def put_cache(cache: dict[str, Any], key: str, value: Any) -> None:
     cache[key] = {"t": time.time(), "v": value}
 
 
-def fetch_statuses_cached(user: str, cache: dict[str, Any], use_cache: bool) -> dict[int, str]:
-    key = f"{CACHE_VERSION}|statuses|{user.lower()}"
+def fetch_entries_cached(user: str, cache: dict[str, Any], use_cache: bool) -> dict[int, dict[str, Any]]:
+    key = f"{CACHE_VERSION}|entries|{user.lower()}"
     if use_cache and is_fresh(cache, key, WATCHED_MAX_AGE):
         return {int(k): v for k, v in cache[key]["v"].items()}
-    statuses = fetch_list_statuses(user)
-    put_cache(cache, key, {str(k): v for k, v in statuses.items()})
-    return statuses
+    entries = fetch_list_entries(user)
+    put_cache(cache, key, {str(k): v for k, v in entries.items()})
+    return entries
 
 
 def media_by_id_cached(media_id: int, cache: dict[str, Any], use_cache: bool, max_age: float) -> dict[str, Any]:
@@ -752,6 +754,7 @@ class ViewState:
     sort_key: str = "score"
     desc: bool = True
     statuses: set[str] = field(default_factory=lambda: set(DEFAULT_LIST_STATUSES))  # empty = all statuses
+    include_missing: bool = False  # also show list entries with no local files
 
     def reset_sort(self, key: str) -> None:
         self.sort_key = key
@@ -775,6 +778,8 @@ def apply_view(rows: list[tuple[Series, dict[str, Any]]], state: ViewState,
         if state.formats and (media.get("format") or "") not in state.formats:
             continue
         if state.statuses and list_status(statuses, media) not in state.statuses:
+            continue
+        if not state.include_missing and s.files == 0:
             continue
         if state.tags:
             tags = row_tags(media)
@@ -849,12 +854,12 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, s
 # ---------------------------------------------------------------- TUI
 
 def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
-            session: Session | None, login_note: str = "") -> None:
+            session: Session | None, login_note: str = "", include_missing: bool = False) -> None:
     import curses  # imported here so the rest of the tool does not need a terminal
 
     def app(stdscr: "curses.window") -> None:
         curses.curs_set(0)
-        state = ViewState()
+        state = ViewState(include_missing=include_missing)
         cursor = top = 0
         message = login_note
 
@@ -1108,7 +1113,8 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             label = SORT_OPTIONS[state.sort_key][0]
             put(0, 0, f"anifinder: {len(view)} of {len(rows)} not watched", curses.A_BOLD)
             status_f = ", ".join(STATUS_LABELS[st] for st in STATUS_ORDER if st in state.statuses) or "all"
-            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | list: {status_f} | sort: {label} "
+            files_f = "incl. not downloaded" if state.include_missing else "downloaded only"
+            put(1, 0, f"format: {fmt_f} | tags: {tag_f} | list: {status_f} | files: {files_f} | sort: {label} "
                       f"{'desc' if state.desc else 'asc'}")
 
             aw = max(8, w - 80)
@@ -1126,7 +1132,8 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
                         f"{str(score):>3}  {str(eps):>3}  {str(year):>4}  {media.get('format') or '-'}")
                 put(3 + i, 0, line, curses.A_REVERSE if pos == cursor else 0)
             put(h - 2, 0, message)
-            put(h - 1, 0, "j/k move  f formats  t tags  l status  s sort  r reverse  c clear  x random  enter details  q quit")
+            put(h - 1, 0, "j/k move  f formats  t tags  l status  d not downloaded  s sort  r reverse  c clear  "
+                          "x random  enter details  q quit")
             stdscr.refresh()
             message = ""
 
@@ -1154,6 +1161,11 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             elif key == ord("l"):
                 pick_statuses()
                 cursor = 0
+            elif key == ord("d"):
+                state.include_missing = not state.include_missing
+                cursor = 0
+                message = ("Showing shows you have no files for too." if state.include_missing
+                           else "Hiding shows you have no files for.")
             elif key == ord("s"):
                 pick_sort()
             elif key == ord("r"):
@@ -1196,6 +1208,8 @@ def main() -> int:
                         help="without the TUI, only print the top N suggestions (default: all)")
     parser.add_argument("--no-tui", action="store_true", help="print a plain table instead of the interactive list")
     parser.add_argument("--refresh", action="store_true", help="ignore cached AniList results and the watched list")
+    parser.add_argument("--include-missing", action="store_true",
+                        help="also show shows on your AniList list that you have no files for (toggle with d)")
     parser.add_argument("--cache-days", type=float, default=DEFAULT_CACHE_DAYS,
                         help=f"how many days AniList results are reused (default: {DEFAULT_CACHE_DAYS})")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="cache file")
@@ -1231,8 +1245,9 @@ def main() -> int:
 
     try:
         print(f"Fetching list for '{args.user}'...")
-        statuses = fetch_statuses_cached(args.user, cache, use_cache)
-        print(f"  {len(statuses)} entries on AniList")
+        entries = fetch_entries_cached(args.user, cache, use_cache)
+        statuses = {media_id: e["status"] for media_id, e in entries.items()}
+        print(f"  {len(entries)} entries on AniList")
 
         # Work out how each series is looked up: by alias ID, by alias title, or by its own name.
         aliases = load_aliases(args.aliases)
@@ -1268,10 +1283,22 @@ def main() -> int:
         return 1
     save()
 
+    # List entries with no local files: shown only when "not downloaded" is on.
+    matched_ids = {m["id"] for _, m in to_watch}
+    not_downloaded = 0
+    for media_id, e in entries.items():
+        if media_id not in matched_ids:
+            to_watch.append((Series(display_name(e["media"])), e["media"]))
+            not_downloaded += 1
+
     to_watch.sort(key=lambda r: (-(r[1].get("averageScore") or 0), r[0].label.lower()))
-    shown_default = [r for r in to_watch if list_status(statuses, r[1]) in DEFAULT_LIST_STATUSES]
-    print(f"\nOn your list: {len(to_watch)} matched; {len(shown_default)} shown by default "
-          f"(Planning, Watching, Not on list). The rest are in the status filter.")
+    shown_default = [
+        r for r in to_watch
+        if list_status(statuses, r[1]) in DEFAULT_LIST_STATUSES and (args.include_missing or r[0].files)
+    ]
+    print(f"\nOn your list: {len(to_watch) - not_downloaded} downloaded, {not_downloaded} not downloaded. "
+          f"{len(shown_default)} shown by default (Planning, Watching, Not on list"
+          f"{', not downloaded' if args.include_missing else ''}).")
 
     print(f"\nCould not match on AniList ({len(unmatched)}), check the names:")
     print("  " + ", ".join(s.label for s in unmatched) if unmatched else "  (none)")
@@ -1283,7 +1310,7 @@ def main() -> int:
         print("\nNothing matched.")
     elif interactive:
         session, login_note = load_session()
-        run_tui(to_watch, statuses, session, login_note)
+        run_tui(to_watch, statuses, session, login_note, include_missing=args.include_missing)
     elif not shown_default:
         print("\nNothing to show by default. Run in a terminal and press l to pick other statuses.")
     else:
