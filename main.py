@@ -385,7 +385,7 @@ query ($name: String) {{
   MediaListCollection(userName: $name, type: ANIME) {{
     lists {{
       status
-      entries {{ status media {{ {MEDIA_FIELDS} }} }}
+      entries {{ status progress media {{ {MEDIA_FIELDS} }} }}
     }}
   }}
 }}
@@ -446,7 +446,7 @@ def fetch_list_entries(user: str) -> dict[int, dict[str, Any]]:
             status = entry.get("status") or lst.get("status")
             media = entry.get("media")
             if status and media:
-                entries[media["id"]] = {"status": status, "media": media}
+                entries[media["id"]] = {"status": status, "progress": entry.get("progress") or 0, "media": media}
     return entries
 
 
@@ -682,7 +682,8 @@ def fetch_episode_titles(media_id: int, cache: dict[str, Any], use_cache: bool, 
 
 
 def fetch_entries_cached(user: str, cache: dict[str, Any], use_cache: bool) -> dict[int, dict[str, Any]]:
-    key = f"{CACHE_VERSION}|entries|{user.lower()}"
+    # "entries2": the cached lists from before progress was stored would show no green rows.
+    key = f"{CACHE_VERSION}|entries2|{user.lower()}"
     if use_cache and is_fresh(cache, key, WATCHED_MAX_AGE):
         return {int(k): v for k, v in cache[key]["v"].items()}
     entries = fetch_list_entries(user)
@@ -1102,12 +1103,25 @@ def print_table(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, s
 def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             session: Session | None, login_note: str = "", include_missing: bool = False,
             track_store: TrackStore | None = None, save: Callable[[], None] = lambda: None,
-            fetch_titles: Callable[[int], dict[int, str]] = lambda media_id: {}) -> None:
+            fetch_titles: Callable[[int], dict[int, str]] = lambda media_id: {},
+            progress: dict[int, int] | None = None) -> None:
     store = track_store or TrackStore({}, use_cache=False)
+    progress = progress if progress is not None else {}  # AniList id -> episodes you have watched
     import curses  # imported here so the rest of the tool does not need a terminal
 
     def app(stdscr: "curses.window") -> None:
         curses.curs_set(0)
+        # Colors are optional: without them the watched episodes just show in the normal text color.
+        watched_attr = 0
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()  # keep the terminal's own background
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            curses.init_pair(1, curses.COLOR_GREEN, bg)
+            watched_attr = curses.color_pair(1)
         state = ViewState(include_missing=include_missing)
         cursor = top = 0
         message = login_note
@@ -1256,6 +1270,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
             try:
                 note += " | " + session.set_progress(media, f.episode)
                 entry, _ = session.get_entry(media["id"])
+                progress[media["id"]] = (entry or {}).get("progress") or 0  # refresh the green rows
                 current = (entry or {}).get("score")
                 score = ask_score(current, session.score_format)
                 if score is not None:
@@ -1330,6 +1345,7 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
                         put(row, x + 12, v)
 
                     table_top = 2 + half + 1
+                    watched_upto = progress.get(media["id"], 0)  # read here so a play updates the colors
                     put(table_top, 2, "Files (enter plays the selected file and updates your progress):",
                         curses.A_BOLD)
                     head = table_top + 1
@@ -1350,7 +1366,9 @@ def run_tui(rows: list[tuple[Series, dict[str, Any]]], statuses: dict[int, str],
                     for i, f in enumerate(s.episode_files[file_top: file_top + visible]):
                         pos = file_top + i
                         ep, title, audio, subs = file_row(store, f, titles)
-                        attr = curses.A_REVERSE if pos == file_cursor else 0
+                        # Episodes at or below your AniList progress are green.
+                        watched = f.episode is not None and f.episode <= watched_upto
+                        attr = (curses.A_REVERSE if pos == file_cursor else 0) | (watched_attr if watched else 0)
                         put(first_row + i, 2, fmt.format(ep, title[:title_w], audio[:10], subs[:10], f.path.name),
                             attr)
                     put(h - 2, 0, note)
@@ -1540,6 +1558,7 @@ def main() -> int:
         print(f"Fetching list for '{args.user}'...")
         entries = fetch_entries_cached(args.user, cache, use_cache)
         statuses = {media_id: e["status"] for media_id, e in entries.items()}
+        progress = {media_id: e.get("progress") or 0 for media_id, e in entries.items()}
         print(f"  {len(entries)} entries on AniList")
 
         # Work out how each series is looked up: by alias ID, by alias title, or by its own name.
@@ -1615,7 +1634,7 @@ def main() -> int:
 
         try:
             run_tui(to_watch, statuses, session, login_note, include_missing=args.include_missing,
-                    track_store=tracks, save=save, fetch_titles=fetch_titles)
+                    track_store=tracks, save=save, fetch_titles=fetch_titles, progress=progress)
         finally:
             tracks.poll()
             tracks.shutdown()
